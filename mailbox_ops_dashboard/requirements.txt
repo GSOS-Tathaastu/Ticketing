@@ -1,0 +1,16 @@
+# Core (required)
+SQLAlchemy>=2.0,<3.0
+streamlit>=1.30
+pandas>=2.0
+python-dotenv>=1.0
+
+# Optional — Gmail dev/test connector only (Mode 1 dev). Not needed for
+# .eml export ingestion, IMAP, or the dashboard.
+# google-api-python-client>=2.100
+# google-auth-oauthlib>=1.2
+
+# Optional — nicer charts (the app falls back to Streamlit native charts).
+# plotly>=5.18
+
+# Testing
+pytest>=8.0

@@ -1,0 +1,28 @@
+# Secrets & local config
+.env
+credentials.json
+token.json
+
+# Local data (email PII must never be committed)
+mailbox_ops_dashboard/data/*.db
+mailbox_ops_dashboard/data/raw/
+mailbox_ops_dashboard/data/eml_exports/*
+!mailbox_ops_dashboard/data/eml_exports/.gitkeep
+*.db
+*.sqlite3
+ticket_report.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

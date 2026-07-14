@@ -1,0 +1,13 @@
+# Local-only, privacy-preserving Streamlit config for the confidential mailbox
+# use case. No telemetry, bind to localhost by default.
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
+address = "127.0.0.1"
+enableCORS = true
+enableXsrfProtection = true
+
+[global]
+showWarningOnDirectExecution = false

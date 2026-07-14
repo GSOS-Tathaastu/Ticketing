@@ -346,3 +346,7 @@ LDAP/AD/SSO auth · NIC IMAP/POP/API live sync from VPN · FastAPI + React UI ·
 PostgreSQL · mbox/PST importers · attachment text indexing · per-category/dept
 SLA rules in-UI · notification digests · per-team routing. (No RAG / no DMS —
 out of scope by design.)
+
+See [`ROADMAP.md`](ROADMAP.md) for the full candidate list with rationale and
+rough sizing — nothing there is committed to; it's a working list so
+decisions don't get lost between sessions.

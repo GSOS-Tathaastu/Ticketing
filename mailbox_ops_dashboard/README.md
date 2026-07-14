@@ -22,7 +22,7 @@ cd mailbox_ops_dashboard
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env          # edit domains/mailboxes for your environment
+cp .env.example .env          # minimal bootstrap only — see note below
 
 python main.py seed-demo      # init DB + load 5 bundled sample emails
 python main.py run-dashboard  # open http://localhost:8501
@@ -37,6 +37,15 @@ Demo logins created by `seed-demo`:
 
 > The demo passwords are for local testing only — change them (or don't use
 > `seed-demo`) before any real deployment.
+
+> **Setup note:** `.env` is only the initial bootstrap default now. IMAP
+> host/port/user/mailbox, internal domains, common mailboxes, and SLA/ageing
+> thresholds are meant to be configured **after first login**, by an admin,
+> under **Admin → Settings** and **Admin → SLA rules** — not by hand-editing
+> `.env` on every deployment. Changes there take effect immediately (no
+> restart) and are audit-logged. The one exception: `IMAP_PASSWORD` always
+> stays in `.env` on the host — never stored in the database or shown in the
+> UI, even to admins.
 
 ---
 
@@ -106,7 +115,9 @@ mailbox_ops_dashboard/
 │   ├── roles.py                    # RBAC permission matrix
 │   ├── users.py                    # auth + require() + audit
 │   └── security.py                 # pbkdf2 password hashing (stdlib)
-├── config/settings.py              # all config from .env
+├── config/
+│   ├── settings.py                 # .env bootstrap defaults
+│   └── runtime_settings.py         # admin-editable DB overrides (never IMAP_PASSWORD)
 ├── tests/                          # pytest + bundled sample .eml
 ├── main.py                         # CLI entrypoint
 ├── DESIGN.md · README.md · .env.example · requirements.txt
@@ -131,7 +142,11 @@ PostgreSQL. Core tables:
   counts and last-action time) → multi-agent support
 - **internal_notes** — supervisor/analyst notes (+ closure notes)
 - **audit_logs** — every manual mutation (`old_value` → `new_value`)
-- **sla_rules** — per-priority/category due-hours + at-risk window
+- **sla_rules** — per-priority/category due-hours + at-risk window, editable
+  under Admin → SLA rules
+- **app_settings** — admin-editable key/value overrides of non-secret `.env`
+  config (IMAP host/port/user/mailbox, domains, thresholds, ingestion mode),
+  applied at runtime with no restart. `IMAP_PASSWORD` is never stored here.
 - **sync_runs** — per-ingestion stats (Data-Quality dashboard)
 - **requesting_entities** — AUA/KUA/Sub-AUA/Sub-KUA onboarding extension
   (DESIGN.md §13): entity identity (CIN/PAN/TAN/GSTIN, type, sponsoring
@@ -208,6 +223,14 @@ UI, so an under-privileged user cannot mutate via any code path.
 | **Senior Viewer / Leadership** | Read-only dashboards + drill-down, no edits |
 | **Analyst** | View team/assigned tickets, update permitted status, add notes |
 | **Auditor** | Read-only ticket history + audit logs |
+
+Only **Admin** holds `configure_mailbox` / `configure_internal_domains` /
+`configure_sla` / `configure_ingestion` — Managers and Analysts can edit
+ticket *data* (owner, status, notes, agent corrections, requester
+corrections) but never the system's own operational configuration. This is
+enforced at the service layer (`config/runtime_settings.py`'s `OVERRIDABLE`
+map declares which permission each setting needs), not just by hiding the
+Admin page in the UI.
 
 ---
 

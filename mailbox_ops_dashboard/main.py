@@ -270,8 +270,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> None:
+    from config.runtime_settings import apply_db_overrides
+
     parser = build_parser()
     args = parser.parse_args(argv)
+    with session_scope() as s:
+        apply_db_overrides(s)  # admin-saved settings take effect before any command runs
     args.func(args)
 
 

@@ -279,6 +279,22 @@ class AuditLog(Base):
 
 
 # --------------------------------------------------------------------------- #
+# App settings — admin-editable, DB-backed overrides of non-secret .env
+# config (IMAP host/port/user/mailbox, domains, thresholds, ingestion mode).
+# Deliberately excludes IMAP_PASSWORD and any other secret — those stay
+# .env-only, never stored here or shown in the UI. See
+# config/runtime_settings.py.
+# --------------------------------------------------------------------------- #
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(Text)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+    updated_by_user_id = Column(Integer, ForeignKey("users.id"))
+
+
+# --------------------------------------------------------------------------- #
 # SLA rules
 # --------------------------------------------------------------------------- #
 class SlaRule(Base):

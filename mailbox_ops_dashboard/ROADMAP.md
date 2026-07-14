@@ -26,11 +26,10 @@ Nothing here should be started without an explicit go-ahead.
   take a single `Ticket`). Multi-select assign-owner / set-status / set
   category from the queue table would matter once a supervisor is managing
   dozens of tickets at once.
-- **Editable SLA rules UI.** `Admin → SLA rules` is currently read-only
-  (`dashboard/app.py::page_admin`) — thresholds can only be changed via
-  `.env` defaults today. Low effort: the `sla_rules` table and
-  `sla_engine.get_sla_rule` already support per-category overrides, it just
-  needs a form.
+- ~~**Editable SLA rules UI.**~~ **Done.** `Admin → SLA rules` is now
+  editable (edit existing + add category-specific rules), admin-only
+  (`configure_sla`), audit-logged. Delivered alongside the broader
+  admin-editable settings feature below.
 - **Bulk import of `RequestingEntity` records** (CSV). Entities are
   currently registered one at a time in `Admin → Entities`, or discovered
   automatically from correspondence. If UIDAI already maintains a master

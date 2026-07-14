@@ -12,11 +12,14 @@ import zipfile
 from sqlalchemy.orm import Session
 
 from auth.users import require, write_audit
+from config.runtime_settings import NEVER_OVERRIDABLE, OVERRIDABLE, apply_db_overrides, effective_settings_dict
 from db.models import (
+    AppSetting,
     AuditLog,
     Email,
     InternalNote,
     RequestingEntity,
+    SlaRule,
     SyncRun,
     Ticket,
     TicketAgent,
@@ -507,6 +510,80 @@ def audit_logs(session: Session, limit: int = 200) -> list[AuditLog]:
 def recalc(session: Session, user: User) -> dict:
     require(user, "configure_ingestion")
     return rebuild_tickets(session)
+
+
+# --------------------------------------------------------------------------- #
+# Admin-editable runtime settings (config/runtime_settings.py). IMAP_PASSWORD
+# and other secrets are never accepted here — they stay .env-only.
+# --------------------------------------------------------------------------- #
+def get_app_settings(session: Session) -> dict:
+    return effective_settings_dict(session)
+
+
+def update_app_settings(session: Session, user: User, **fields) -> None:
+    unknown = set(fields) - set(OVERRIDABLE)
+    if unknown & NEVER_OVERRIDABLE:
+        raise PermissionError(f"{unknown & NEVER_OVERRIDABLE} can never be set via the dashboard — .env only")
+    if unknown:
+        raise ValueError(f"Unknown setting(s): {unknown}")
+
+    changed = {}
+    for key, value in fields.items():
+        _attr, _coerce, perm = OVERRIDABLE[key]
+        require(user, perm)
+        row = session.get(AppSetting, key)
+        old = row.value if row else None
+        new = ",".join(value) if isinstance(value, list) else str(value)
+        if old == new:
+            continue
+        changed[key] = (old, new)
+        if row:
+            row.value = new
+            row.updated_by_user_id = user.id
+        else:
+            session.add(AppSetting(key=key, value=new, updated_by_user_id=user.id))
+
+    if changed:
+        # SessionLocal is autoflush=False (db/database.py), so a freshly
+        # session.add()-ed row is NOT visible to apply_db_overrides' bulk
+        # query without an explicit flush first — session.get()-by-PK above
+        # would find it via the identity map, but Query.all() would not.
+        session.flush()
+        apply_db_overrides(session)  # take effect immediately in this session, not just next render
+        write_audit(session, user=user, action_type="update_app_settings", entity_type="app_setting",
+                    entity_id="settings", old_value={k: v[0] for k, v in changed.items()},
+                    new_value={k: v[1] for k, v in changed.items()})
+
+
+def list_sla_rules(session: Session) -> list[SlaRule]:
+    return session.query(SlaRule).order_by(SlaRule.priority, SlaRule.category).all()
+
+
+def update_sla_rule(session: Session, user: User, rule_id: int, *,
+                    due_hours: int, at_risk_hours: int) -> None:
+    require(user, "configure_sla")
+    rule = session.get(SlaRule, rule_id)
+    if rule is None:
+        raise ValueError(f"SLA rule {rule_id} not found")
+    old = {"due_hours": rule.due_hours, "at_risk_hours": rule.at_risk_hours}
+    rule.due_hours = due_hours
+    rule.at_risk_hours = at_risk_hours
+    write_audit(session, user=user, action_type="update_sla_rule", entity_type="sla_rule",
+                entity_id=rule_id, old_value=old,
+                new_value={"due_hours": due_hours, "at_risk_hours": at_risk_hours})
+
+
+def create_sla_rule(session: Session, user: User, *, priority: str, category: str,
+                    due_hours: int, at_risk_hours: int) -> SlaRule:
+    require(user, "configure_sla")
+    rule = SlaRule(priority=priority.strip().lower(), category=category.strip() or "*",
+                   due_hours=due_hours, at_risk_hours=at_risk_hours)
+    session.add(rule)
+    session.flush()
+    write_audit(session, user=user, action_type="create_sla_rule", entity_type="sla_rule",
+                entity_id=rule.id, new_value={"priority": rule.priority, "category": rule.category,
+                                              "due_hours": due_hours, "at_risk_hours": at_risk_hours})
+    return rule
 
 
 # --------------------------------------------------------------------------- #

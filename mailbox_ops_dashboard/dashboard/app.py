@@ -100,6 +100,13 @@ def can(permission: str) -> bool:
 # --------------------------------------------------------------------------- #
 def page_executive(s):
     st.header("A · Executive Overview")
+    if settings.ingestion_mode == "live_sync" and not settings.imap_host:
+        if can("configure_mailbox"):
+            st.warning("⚠️ Live IMAP sync is selected but no IMAP host is configured yet — "
+                      "go to **Admin → Settings** to finish setup.")
+        else:
+            st.warning("⚠️ Live IMAP sync isn't fully configured yet — ask an admin to finish setup "
+                      "under Admin → Settings.")
     m = svc.executive_metrics(s)
     cols = st.columns(5)
     tiles = [
@@ -747,7 +754,7 @@ def page_admin(s):
     st.header("Admin")
     from db.models import SlaRule, User
 
-    tabs = st.tabs(["Users", "SLA rules", "Entities", "Config"])
+    tabs = st.tabs(["Users", "SLA rules", "Entities", "Settings"])
     with tabs[0]:
         st.subheader("Users")
         users = s.query(User).all()
@@ -781,12 +788,44 @@ def page_admin(s):
                 st.rerun()
     with tabs[1]:
         st.subheader("SLA rules")
-        rules = s.query(SlaRule).all()
+        rules = svc.list_sla_rules(s)
         st.dataframe(pd.DataFrame([{
-            "Priority": r.priority, "Category": r.category, "Due (hrs)": r.due_hours,
+            "ID": r.id, "Priority": r.priority, "Category": r.category, "Due (hrs)": r.due_hours,
             "At-risk (hrs)": r.at_risk_hours,
         } for r in rules]), use_container_width=True, hide_index=True)
-        st.caption("Edit SLA thresholds via .env defaults or extend here in a future iteration.")
+        if can("configure_sla") and rules:
+            st.markdown("**Edit a rule**")
+            ropts = {f"{r.priority} / {r.category} (id={r.id})": r.id for r in rules}
+            rpick = st.selectbox("Rule", list(ropts))
+            cur_rule = next(r for r in rules if r.id == ropts[rpick])
+            c = st.columns(2)
+            due2 = c[0].number_input("Due (hrs)", min_value=1, value=cur_rule.due_hours)
+            risk2 = c[1].number_input("At-risk window (hrs before due)", min_value=1, value=cur_rule.at_risk_hours)
+            if st.button("Save rule"):
+                _mutate(s, lambda ss: svc.update_sla_rule(ss, UserObj(current_user()), ropts[rpick],
+                                                          due_hours=int(due2), at_risk_hours=int(risk2)))
+        if can("configure_sla"):
+            st.markdown("**Add a category-specific rule** _(falls back to the priority-only `*` rule "
+                       "when no exact category match exists)_")
+            with st.form("new_sla_rule"):
+                c = st.columns(4)
+                prio2 = c[0].selectbox("Priority", PRIORITIES, key="new_sla_priority")
+                cat2 = c[1].text_input("Category (\"*\" for all)", value="*")
+                due3 = c[2].number_input("Due (hrs)", min_value=1, value=48)
+                risk3 = c[3].number_input("At-risk (hrs)", min_value=1, value=8)
+                if st.form_submit_button("Add rule"):
+                    ss = get_session()
+                    try:
+                        svc.create_sla_rule(ss, UserObj(current_user()), priority=prio2, category=cat2,
+                                            due_hours=int(due3), at_risk_hours=int(risk3))
+                        ss.commit()
+                        st.success("Rule added")
+                    except Exception as exc:  # noqa: BLE001
+                        ss.rollback()
+                        st.error(str(exc))
+                    finally:
+                        ss.close()
+                    st.rerun()
     with tabs[2]:
         st.subheader("Requesting entities (AUA/KUA onboarding extension)")
         entities = svc.list_entities(s)
@@ -860,17 +899,59 @@ def page_admin(s):
                         st.rerun()
 
     with tabs[3]:
-        st.subheader("Configuration (read-only view of .env-derived settings)")
-        st.json({
-            "database_url": settings.database_url,
-            "ingestion_mode": settings.ingestion_mode,
-            "internal_domains": settings.internal_domains,
-            "common_mailboxes": settings.common_mailboxes,
-            "stale_days": settings.stale_days,
-            "store_raw_email": settings.store_raw_email,
-            "session_timeout_minutes": settings.session_timeout_minutes,
-        })
-        st.caption("Change these in `.env` and restart. Mailbox secrets are never shown.")
+        st.subheader("Settings")
+        st.caption("Admin-only, audit-logged. Values here override `.env` immediately, no restart "
+                  "needed — `.env` is only the initial bootstrap default now.")
+        st.info("🔒 **IMAP password is never stored here or shown in this UI** — it stays in `.env` "
+               "on the host machine only, same as before. Everything below is non-secret.")
+        cur = svc.get_app_settings(s)
+        editable = can("configure_mailbox") or can("configure_internal_domains") or can("configure_sla")
+
+        with st.form("app_settings"):
+            st.markdown("**Mailbox connection** _(IMAP — requires `configure_mailbox`)_")
+            c = st.columns(3)
+            imap_host2 = c[0].text_input("IMAP host", cur["imap_host"], disabled=not can("configure_mailbox"))
+            imap_port2 = c[1].number_input("IMAP port", value=cur["imap_port"], disabled=not can("configure_mailbox"))
+            imap_user2 = c[2].text_input("IMAP user", cur["imap_user"], disabled=not can("configure_mailbox"))
+            c = st.columns(3)
+            imap_mailbox2 = c[0].text_input("IMAP mailbox/folder", cur["imap_mailbox"], disabled=not can("configure_mailbox"))
+            imap_ssl2 = c[1].checkbox("Use SSL", value=cur["imap_use_ssl"], disabled=not can("configure_mailbox"))
+            mode_opts = ["export", "live_sync", "manual"]
+            mode2 = c[2].selectbox("Ingestion mode", mode_opts,
+                                   index=mode_opts.index(cur["ingestion_mode"]) if cur["ingestion_mode"] in mode_opts else 0,
+                                   disabled=not can("configure_ingestion"))
+
+            st.markdown("**Identity** _(requires `configure_internal_domains`)_")
+            c = st.columns(2)
+            domains2 = c[0].text_area("Internal domains (comma-separated)",
+                                      ", ".join(cur["internal_domains"]), disabled=not can("configure_internal_domains"))
+            mailboxes2 = c[1].text_area("Common/shared mailboxes (comma-separated)",
+                                        ", ".join(cur["common_mailboxes"]), disabled=not can("configure_internal_domains"))
+
+            st.markdown("**Thresholds** _(requires `configure_sla`)_")
+            c = st.columns(4)
+            stale2 = c[0].number_input("Stale after (days)", min_value=1, value=cur["stale_days"], disabled=not can("configure_sla"))
+            due2 = c[1].number_input("Default SLA due (hrs)", min_value=1, value=cur["default_sla_hours"], disabled=not can("configure_sla"))
+            risk2 = c[2].number_input("Default at-risk window (hrs)", min_value=1, value=cur["sla_at_risk_hours"], disabled=not can("configure_sla"))
+            timeout2 = c[3].number_input("Session timeout (min)", min_value=1, value=cur["session_timeout_minutes"], disabled=not can("configure_mailbox"))
+
+            if st.form_submit_button("Save settings", disabled=not editable):
+                fields = {}
+                if can("configure_mailbox"):
+                    fields.update(imap_host=imap_host2, imap_port=int(imap_port2), imap_user=imap_user2,
+                                 imap_mailbox=imap_mailbox2, imap_use_ssl=imap_ssl2,
+                                 session_timeout_minutes=int(timeout2))
+                if can("configure_ingestion"):
+                    fields["ingestion_mode"] = mode2
+                if can("configure_internal_domains"):
+                    fields["internal_domains"] = [d.strip() for d in domains2.split(",") if d.strip()]
+                    fields["common_mailboxes"] = [m.strip() for m in mailboxes2.split(",") if m.strip()]
+                if can("configure_sla"):
+                    fields.update(stale_days=int(stale2), default_sla_hours=int(due2), sla_at_risk_hours=int(risk2))
+                _mutate(s, lambda ss: svc.update_app_settings(ss, UserObj(current_user()), **fields))
+
+        if not editable:
+            st.caption("Read-only for your role.")
 
 
 # --------------------------------------------------------------------------- #
@@ -929,6 +1010,14 @@ def main():
         init_db()
     except Exception:
         pass
+
+    from config.runtime_settings import apply_db_overrides
+
+    _s = get_session()
+    try:
+        apply_db_overrides(_s)  # admin-saved settings take effect on every render, no restart needed
+    finally:
+        _s.close()
 
     if not current_user():
         login_view()

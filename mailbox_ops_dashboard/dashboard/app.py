@@ -471,6 +471,15 @@ def _edit_panel(s, ticket, omap, events):
             if st.button("Save fields"):
                 _mutate(s, lambda ss: svc.set_ticket_fields(ss, uo, svc.get_ticket(ss, ticket.id),
                                                             department=dept, category=cat, priority=prio))
+        if can("edit_ticket_fields"):
+            st.caption("Correct requester — for a garbled name, or the wrong participant picked "
+                      "out of a multi-recipient thread. Locks against being overwritten by rebuilds.")
+            c = st.columns(2)
+            req_email = c[0].text_input("Requester email", ticket.requester_email or "")
+            req_name = c[1].text_input("Requester name", ticket.requester_name or "")
+            if st.button("Save requester"):
+                _mutate(s, lambda ss: svc.correct_requester(ss, uo, svc.get_ticket(ss, ticket.id),
+                                                            req_email.strip() or None, req_name.strip() or None))
 
     with tabs[1]:
         if can("set_manual_status"):
@@ -656,6 +665,13 @@ def page_data_quality(s):
         st.divider()
         if st.button("🔄 Recalculate tickets now"):
             _mutate(s, lambda ss: svc.recalc(ss, UserObj(current_user())))
+    st.divider()
+    st.subheader("Full data export")
+    st.caption("Every dashboard's data as one .zip of CSVs — tickets, executive overview, "
+              "ageing/SLA, owner performance, category breakdown, requesting entities.")
+    st.download_button("⬇️ Download full report (.zip)", data=svc.build_full_export_zip(s),
+                       file_name=f"mailbox_ops_full_report_{_now().strftime('%Y%m%d_%H%M')}.zip",
+                       mime="application/zip")
 
 
 # --------------------------------------------------------------------------- #
@@ -810,6 +826,38 @@ def page_admin(s):
                     finally:
                         ss.close()
                     st.rerun()
+
+            if entities:
+                st.markdown("**Correct an existing entity** _(e.g. an auto-detected name/PAN that's wrong)_")
+                eopts = {f"{e.name} (id={e.id})": e.id for e in entities}
+                epick = st.selectbox("Entity", list(eopts), key="edit_entity_pick")
+                cur = svc.get_entity(s, eopts[epick])
+                with st.form("edit_entity"):
+                    c = st.columns(3)
+                    name2 = c[0].text_input("Name", cur.name)
+                    etype2 = c[1].selectbox("Type", ENTITY_TYPES,
+                                            index=ENTITY_TYPES.index(cur.entity_type) if cur.entity_type in ENTITY_TYPES else 0)
+                    domains2 = c[2].text_input("Known domains (comma-separated)", cur.known_domains or "")
+                    c = st.columns(4)
+                    cin2 = c[0].text_input("CIN", cur.cin or "")
+                    pan2 = c[1].text_input("PAN", cur.pan or "")
+                    tan2 = c[2].text_input("TAN", cur.tan or "")
+                    gstin2 = c[3].text_input("GSTIN", cur.gstin or "")
+                    if st.form_submit_button("Save changes"):
+                        ss = get_session()
+                        try:
+                            svc.create_or_update_entity(
+                                ss, UserObj(current_user()), entity_id=cur.id, name=name2,
+                                entity_type=etype2, known_domains=domains2 or None,
+                                cin=cin2 or None, pan=pan2 or None, tan=tan2 or None, gstin=gstin2 or None)
+                            ss.commit()
+                            st.success(f"Updated {name2}")
+                        except Exception as exc:  # noqa: BLE001
+                            ss.rollback()
+                            st.error(str(exc))
+                        finally:
+                            ss.close()
+                        st.rerun()
 
     with tabs[3]:
         st.subheader("Configuration (read-only view of .env-derived settings)")

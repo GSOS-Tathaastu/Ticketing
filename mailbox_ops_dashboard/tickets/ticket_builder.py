@@ -81,10 +81,14 @@ def _build_one_ticket(session: Session, thread_key: str, emails: list[Email], kn
         ticket.ticket_id = f"TCK-{ticket.id:06d}"
 
     subject = next((e.subject for e in emails if e.subject), "(no subject)")
-    req_email, req_name = _requester(emails)
     ticket.subject = subject
-    ticket.requester_email = req_email
-    ticket.requester_name = req_name
+    # A supervisor's manual requester correction (data-quality fix — e.g. a
+    # garbled display name, or the wrong participant picked out of a
+    # multi-recipient thread) must survive rebuilds, same as owner/category.
+    if not ticket.requester_manual_override_flag:
+        req_email, req_name = _requester(emails)
+        ticket.requester_email = req_email
+        ticket.requester_name = req_name
     if is_new:
         ticket.created_at = emails[0].sent_at or dt.datetime.now(dt.timezone.utc)
         # AUA/KUA onboarding extension (DESIGN.md §13.1/§13.3): entity linking

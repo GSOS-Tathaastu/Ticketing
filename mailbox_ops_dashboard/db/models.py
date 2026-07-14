@@ -134,6 +134,7 @@ class Ticket(Base):
     subject = Column(Text)
     requester_email = Column(String(320), index=True)
     requester_name = Column(String(255))
+    requester_manual_override_flag = Column(Boolean, default=False)  # see ticket_builder._requester
 
     primary_owner_user_id = Column(Integer, ForeignKey("users.id"))
     department = Column(String(128))

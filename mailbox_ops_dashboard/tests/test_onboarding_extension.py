@@ -2,7 +2,9 @@
 ingest 5 emails across 5 UNRELATED subjects/Message-ID chains for one
 entity and verify they fold into a single onboarding ticket, while a
 non-onboarding email from the same entity stays a separate ticket."""
-from db.models import RequestingEntity, Ticket, TicketEvent
+from auth.users import create_user
+from dashboard import service as svc
+from db.models import RequestingEntity, Ticket, TicketEvent, User
 from ingestion.export_parser import ingest_export_folder
 from tickets.entity_detection_engine import ONBOARDING_CATEGORY
 from tickets.stage_detection_engine import PRODUCTION_LIVE
@@ -65,3 +67,24 @@ def test_onboarding_rebuild_is_idempotent(session):
 
     assert session.query(RequestingEntity).count() == before_entities
     assert session.query(Ticket).count() == before_tickets
+
+
+def test_edit_existing_entity_corrects_bad_auto_detection(session):
+    """Admin -> Entities -> 'Correct an existing entity': auto-created
+    entities can have a wrong name/ID guessed from content, so
+    create_or_update_entity must support editing in place, not just creating."""
+    ingest_export_folder(session, SAMPLE_ONBOARDING_DIR)
+    ent = session.query(RequestingEntity).one()
+    admin = session.query(User).filter_by(email="entity-edit-admin@uidai.gov.in").first()
+    if not admin:
+        admin = create_user(session, email="entity-edit-admin@uidai.gov.in", name="Admin",
+                            role="admin", password="x", internal=True)
+
+    svc.create_or_update_entity(session, admin, entity_id=ent.id,
+                                name="Acme Fintech Private Limited", gstin="27AAACA1234A1Z5")
+    session.flush()
+
+    refetched = session.get(RequestingEntity, ent.id)
+    assert refetched.name == "Acme Fintech Private Limited"
+    assert refetched.gstin == "27AAACA1234A1Z5"
+    assert refetched.pan == "AAACA1234A"  # untouched fields survive a partial edit

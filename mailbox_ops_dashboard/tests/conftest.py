@@ -26,6 +26,24 @@ def _init_db():
     yield
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _clean_db_per_module():
+    """Each test FILE gets a logically fresh database. Several tests make
+    absolute-count assertions (e.g. `assert len(tickets) == 2`) that only
+    hold if that file has the DB to itself — not a cumulative one shared
+    with every other file in the run, which broke the moment a second file
+    started ingesting its own sample data. Tests WITHIN a file still build
+    on each other's state as before (this only resets at the module
+    boundary, not per-test)."""
+    from db.database import engine
+    from db.models import Base
+
+    with engine.begin() as conn:
+        for table in reversed(Base.metadata.sorted_tables):
+            conn.execute(table.delete())
+    yield
+
+
 @pytest.fixture
 def session():
     with session_scope() as s:

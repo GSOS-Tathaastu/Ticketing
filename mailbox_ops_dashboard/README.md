@@ -163,7 +163,10 @@ layer** and written to the audit log.
   (first/last response, follow-ups, replies, agents involved, pending party,
   suggested next action). Editable per role: owner, contributing agent, dept,
   category, priority, manual status, notes, closure note, detected-agent
-  correction, with an **inferred-vs-manual mismatch warning**.
+  correction, **and requester email/name** (a data-quality fix for a garbled
+  name or the wrong participant picked out of a multi-recipient thread —
+  locked against being overwritten by the next rebuild), with an
+  **inferred-vs-manual mismatch warning**.
 - **D · Ageing & SLA** — buckets (0-1/2-3/4-7/8-15/15+), met/at-risk/breached,
   avg first-response & closure, oldest pending.
 - **E · Owner / Team Performance** — open by owner, touched-by-agent counts,
@@ -172,7 +175,11 @@ layer** and written to the audit log.
   requester domains.
 - **G · Mailbox Sync & Data Quality** — last sync, processed/failed/dup today,
   unmapped emails, ownerless tickets, unclear status, outbound replies +
-  unknown-agent count, multi-agent ambiguity, **current ingestion mode**.
+  unknown-agent count, multi-agent ambiguity, **current ingestion mode**, and
+  a **"Download full report (.zip)"** button — every dashboard's data (raw
+  tickets + executive/ageing/SLA/owner/category/data-quality metrics +
+  requesting entities) as one .zip of CSVs, also available via
+  `python main.py export-full-report`.
 - **H · AUA/KUA Onboarding** *(DESIGN.md §13)* — one row per requesting
   entity with a visual stage stepper (Application Submitted → Agreement &
   In-Principle Approval → Audit/Compliance Certification → Pre-Production
@@ -180,7 +187,9 @@ layer** and written to the audit log.
   (Annual Audit / Other, kept separate per cycle). The drill-down page shows
   the same entity card, stage stepper, and a document-reference index
   (pointers back to the source email — no document store) whenever a ticket
-  is entity-linked.
+  is entity-linked. Entities can be corrected under **Admin → Entities**
+  (name/type/CIN/PAN/TAN/GSTIN/domains) — useful when auto-detection guesses
+  wrong, e.g. picking a sender's personal name instead of the company's.
 
 *(This is a Streamlit MVP: charts are native bar charts + metric tiles. The
 drill-down uses `st.expander` sections for the expand/collapse requirement.)*

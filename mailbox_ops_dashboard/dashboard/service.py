@@ -3,8 +3,11 @@ here so permission checks (auth.users.require) and audit logging happen at the
 backend level, not just in the UI."""
 from __future__ import annotations
 
+import csv
 import datetime as dt
+import io
 import json
+import zipfile
 
 from sqlalchemy.orm import Session
 
@@ -373,6 +376,22 @@ def set_ticket_fields(session: Session, user: User, ticket: Ticket, **fields) ->
                     new_value={k: v[1] for k, v in changed.items()})
 
 
+def correct_requester(session: Session, user: User, ticket: Ticket,
+                      email: str | None, name: str | None) -> None:
+    """Data-quality fix for a garbled requester name/email, or the wrong
+    participant picked out of a multi-recipient thread. Sets a manual-
+    override flag so ticket_builder's rebuild never overwrites it again."""
+    require(user, "edit_ticket_fields")
+    old = {"email": ticket.requester_email, "name": ticket.requester_name}
+    if email:
+        ticket.requester_email = email.strip().lower()
+    ticket.requester_name = name if name is not None else ticket.requester_name
+    ticket.requester_manual_override_flag = True
+    write_audit(session, user=user, action_type="correct_requester", entity_type="ticket",
+                entity_id=ticket.ticket_id, old_value=old,
+                new_value={"email": ticket.requester_email, "name": ticket.requester_name})
+
+
 def set_manual_status(session: Session, user: User, ticket: Ticket, status: str,
                       closure_note: str | None = None) -> None:
     require(user, "set_manual_status")
@@ -488,6 +507,97 @@ def audit_logs(session: Session, limit: int = 200) -> list[AuditLog]:
 def recalc(session: Session, user: User) -> dict:
     require(user, "configure_ingestion")
     return rebuild_tickets(session)
+
+
+# --------------------------------------------------------------------------- #
+# Full export — every dashboard's data as one downloadable .zip of CSVs.
+# Read-only, no permission gate beyond view_dashboards (checked by the caller).
+# --------------------------------------------------------------------------- #
+def _write_csv_bytes(fieldnames: list[str], rows: list[dict]) -> bytes:
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+    return buf.getvalue().encode("utf-8")
+
+
+def _kv_csv_bytes(d: dict) -> bytes:
+    return _write_csv_bytes(["metric", "value"], [{"metric": k, "value": v} for k, v in d.items()])
+
+
+TICKET_EXPORT_FIELDS = [
+    "ticket_id", "subject", "requester_email", "requester_name", "primary_owner",
+    "department", "category", "priority", "manual_status", "inferred_status",
+    "pending_with", "created_at", "last_email_at", "ageing_days", "sla_status",
+    "sla_due_at", "first_response_at", "resolved_at", "is_escalated", "is_reopened",
+    "contributing_agents", "last_action_by", "requesting_entity",
+    "inferred_onboarding_stage", "manual_onboarding_stage", "closure_note",
+]
+
+
+def _ticket_export_rows(session: Session) -> list[dict]:
+    omap = owners_map(session)
+    rows = []
+    for t in all_tickets(session):
+        owner = omap.get(t.primary_owner_user_id)
+        entity = get_entity(session, t.requesting_entity_id) if t.requesting_entity_id else None
+        rows.append({
+            "ticket_id": t.ticket_id, "subject": t.subject,
+            "requester_email": t.requester_email, "requester_name": t.requester_name,
+            "primary_owner": owner.email if owner else "", "department": t.department,
+            "category": t.category, "priority": t.priority,
+            "manual_status": t.manual_status, "inferred_status": t.inferred_status,
+            "pending_with": t.pending_with, "created_at": t.created_at,
+            "last_email_at": t.last_email_at, "ageing_days": t.ageing_days,
+            "sla_status": t.sla_status, "sla_due_at": t.sla_due_at,
+            "first_response_at": t.first_response_at, "resolved_at": t.resolved_at,
+            "is_escalated": t.is_escalated, "is_reopened": t.is_reopened,
+            "contributing_agents": contributor_count(session, t.id),
+            "last_action_by": t.last_action_by_label,
+            "requesting_entity": entity.name if entity else "",
+            "inferred_onboarding_stage": t.inferred_onboarding_stage,
+            "manual_onboarding_stage": t.manual_onboarding_stage,
+            "closure_note": t.closure_note,
+        })
+    return rows
+
+
+def build_full_export_zip(session: Session) -> bytes:
+    """Everything visible across dashboards A-H, as one .zip of CSVs: raw
+    ticket data plus every aggregate metric, not just the flat ticket table
+    `export-report` produces."""
+    exec_m = executive_metrics(session)
+    ageing_m = ageing_sla_metrics(session)
+    owner_rows = owner_performance(session)
+    cat_m = category_metrics(session)
+    dq_m = data_quality_metrics(session)
+    entities = list_entities(session)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("tickets.csv", _write_csv_bytes(TICKET_EXPORT_FIELDS, _ticket_export_rows(session)))
+        zf.writestr("executive_overview.csv", _kv_csv_bytes(exec_m))
+        zf.writestr("ageing_buckets.csv", _write_csv_bytes(
+            ["bucket", "count"], [{"bucket": k, "count": v} for k, v in ageing_m["buckets"].items()]))
+        zf.writestr("sla_summary.csv", _kv_csv_bytes({
+            **ageing_m["sla"], "avg_first_response_hours": ageing_m["avg_first_response_hours"],
+            "avg_closure_hours": ageing_m["avg_closure_hours"],
+        }))
+        zf.writestr("owner_performance.csv", _write_csv_bytes(
+            ["owner", "email", "open", "breached", "avg_ageing", "closed_this_week",
+             "stale", "multi_agent", "last_action", "count"], owner_rows))
+        zf.writestr("category_metrics.csv", _write_csv_bytes(
+            ["category", "count", "breached", "avg_ageing"], cat_m["by_category"]))
+        zf.writestr("top_requester_domains.csv", _write_csv_bytes(
+            ["domain", "tickets"], [{"domain": d, "tickets": c} for d, c in cat_m["top_domains"]]))
+        zf.writestr("data_quality.csv", _kv_csv_bytes(dq_m))
+        zf.writestr("requesting_entities.csv", _write_csv_bytes(
+            ["id", "name", "entity_type", "cin", "pan", "tan", "gstin", "known_domains", "auto_created"],
+            [{"id": e.id, "name": e.name, "entity_type": e.entity_type, "cin": e.cin,
+              "pan": e.pan, "tan": e.tan, "gstin": e.gstin, "known_domains": e.known_domains,
+              "auto_created": e.auto_created} for e in entities]))
+    return buf.getvalue()
 
 
 # small helpers used by the UI

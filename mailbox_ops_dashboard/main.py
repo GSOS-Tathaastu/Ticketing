@@ -11,6 +11,7 @@ Commands:
   python main.py create-user --email X --name N --role R [--password P]
   python main.py recalculate-tickets
   python main.py export-report [--out report.csv]
+  python main.py export-full-report [--out full_report.zip]  # tickets + every dashboard's metrics
   python main.py seed-demo          # load bundled sample .eml for a quick demo
 """
 from __future__ import annotations
@@ -163,6 +164,19 @@ def cmd_export_report(args) -> None:
     print(f"✓ Report written to {out} ({len(rows)} tickets)")
 
 
+def cmd_export_full_report(args) -> None:
+    """Everything visible across dashboards A-H, as one .zip of CSVs — not
+    just the flat ticket table export-report produces."""
+    from dashboard.service import build_full_export_zip
+
+    out = args.out or "full_report.zip"
+    with session_scope() as s:
+        data = build_full_export_zip(s)
+    with open(out, "wb") as fh:
+        fh.write(data)
+    print(f"✓ Full report written to {out}")
+
+
 def cmd_seed_demo(args) -> None:
     from db.migrations_or_init import bootstrap
     from ingestion.export_parser import ingest_export_folder
@@ -244,6 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("export-report", help="Export tickets to CSV")
     q.add_argument("--out")
     q.set_defaults(func=cmd_export_report)
+
+    q = sub.add_parser("export-full-report", help="Export everything — tickets + all dashboard metrics — as a .zip of CSVs")
+    q.add_argument("--out")
+    q.set_defaults(func=cmd_export_full_report)
 
     q = sub.add_parser("seed-demo", help="Init DB + load bundled sample emails")
     q.set_defaults(func=cmd_seed_demo)

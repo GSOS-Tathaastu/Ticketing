@@ -94,3 +94,28 @@ def test_assign_owner_to_an_already_detected_contributor(session):
     # with no distinct Sender header, remains a legitimate separate contributor).
     contributors = session.query(TicketAgent).filter_by(ticket_id=addr.id, role="contributor").all()
     assert "agent.rao@uidai.gov.in" not in {c.agent_email for c in contributors}
+
+
+def test_correct_requester_survives_rebuild(session):
+    """A supervisor's requester correction (garbled name, wrong participant
+    picked out of a multi-recipient thread) must not get silently overwritten
+    the next time tickets are rebuilt — same non-destructive-rebuild rule as
+    owner/category/notes."""
+    ingest_export_folder(session, SAMPLE_DIR)
+    admin = session.query(User).filter_by(email="requester-test-admin@uidai.gov.in").first()
+    if not admin:
+        admin = create_user(session, email="requester-test-admin@uidai.gov.in", name="Admin",
+                            role="admin", password="x", internal=True)
+    addr = next(t for t in session.query(Ticket).all() if "address" in (t.subject or "").lower())
+    original_email = addr.requester_email
+
+    svc.correct_requester(session, admin, addr, "corrected.person@example.com", "Corrected Person")
+    session.flush()
+    assert addr.requester_email == "corrected.person@example.com"
+    assert addr.requester_name == "Corrected Person"
+
+    rebuild_tickets(session)
+    session.flush()
+    assert addr.requester_email == "corrected.person@example.com", \
+        "manual requester correction was overwritten by rebuild"
+    assert addr.requester_email != original_email

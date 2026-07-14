@@ -1,0 +1,21 @@
+From: UIDAI Helpdesk <helpdesk@uidai.gov.in>
+Sender: Agent Rao <agent.rao@uidai.gov.in>
+Reply-To: Agent Rao <agent.rao@uidai.gov.in>
+To: Ramesh Kumar <ramesh.kumar@example.com>
+Subject: Re: Unable to update address in Aadhaar
+Date: Wed, 08 Jul 2026 15:30:00 +0530
+Message-ID: <res-0004@uidai.gov.in>
+In-Reply-To: <req-0003@example.com>
+References: <req-0001@example.com> <ack-0002@uidai.gov.in> <req-0003@example.com>
+Content-Type: text/plain; charset="utf-8"
+
+Dear Ramesh Kumar,
+
+The issue with your proof-of-address upload has been fixed. The portal was
+rejecting files above 2 MB. Please re-upload your electricity bill compressed
+under 2 MB and the address update will go through. Marking this as resolved.
+
+Regards,
+Agent Rao
+UIDAI Address Update Cell
+agent.rao@uidai.gov.in

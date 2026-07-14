@@ -8,9 +8,16 @@ mailbox_ops_dashboard/data/*.db
 mailbox_ops_dashboard/data/raw/
 mailbox_ops_dashboard/data/eml_exports/*
 !mailbox_ops_dashboard/data/eml_exports/.gitkeep
+mailbox_ops_dashboard/data/launcher.log
 *.db
 *.sqlite3
 ticket_report.csv
+full_report.zip
+
+# PyInstaller build output (rebuild locally with build_exe.bat / .sh — see README)
+mailbox_ops_dashboard/build/
+mailbox_ops_dashboard/dist/
+mailbox_ops_dashboard/build_venv/
 
 # Python
 __pycache__/

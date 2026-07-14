@@ -76,9 +76,12 @@ Nothing here should be started without an explicit go-ahead.
 - **FastAPI + React UI** as a production-grade replacement for the
   Streamlit MVP, if/when the UI needs to go beyond what Streamlit
   comfortably offers (custom auth flows, heavier interactivity, branding).
-- **Windows `.exe` packaging** (PyInstaller + `streamlit-desktop-app`) —
-  evaluated in detail, technically straightforward, currently on hold
-  pending a go-ahead to actually build it.
+- ~~**Windows `.exe` packaging**~~ **Done.** PyInstaller, browser-launch
+  (not `pywebview` — avoids the WebView2 dependency risk entirely). See
+  README "Building the Windows `.exe`". Verified end-to-end against an
+  actual built binary (not just the unfrozen script): login, dashboards,
+  and persistent data storage next to the exe all confirmed working. Must
+  still be built ON Windows — PyInstaller doesn't cross-compile.
 - **Health/heartbeat monitoring for scheduled sync jobs** — if
   `sync-imap`/`sync-gmail` runs on a cron in production, nothing currently
   alerts if it starts silently failing; the Data Quality dashboard shows

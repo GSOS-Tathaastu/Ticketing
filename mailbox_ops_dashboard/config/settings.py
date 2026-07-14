@@ -3,18 +3,27 @@ hard-code secrets. Kept intentionally small and dependency-light."""
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# When frozen by PyInstaller, __file__ resolves into a temp extraction
+# directory (sys._MEIPASS) that's wiped after every run — persistent data
+# (the SQLite DB, raw email store, .env) must live next to the actual .exe
+# instead, which sys.executable reliably points to even in --onefile mode.
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
 
 try:  # optional dependency; app still runs if python-dotenv is absent
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv(BASE_DIR / ".env")  # explicit path — don't depend on CWD
 except Exception:  # pragma: no cover
     pass
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
 

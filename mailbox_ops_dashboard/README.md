@@ -120,6 +120,9 @@ mailbox_ops_dashboard/
 │   └── runtime_settings.py         # admin-editable DB overrides (never IMAP_PASSWORD)
 ├── tests/                          # pytest + bundled sample .eml
 ├── main.py                         # CLI entrypoint
+├── desktop_launcher.py             # .exe entry point (server + open browser)
+├── mailbox_ops_dashboard.spec      # PyInstaller build config
+├── build_exe.bat · build_exe.sh    # build the .exe (Windows) / test build (Linux/macOS)
 ├── DESIGN.md · README.md · .env.example · requirements.txt
 ```
 
@@ -322,6 +325,70 @@ sync-imap` for a real (idempotent, safe-to-repeat) ingest.
 - For multi-user/production, migrate to PostgreSQL (`DATABASE_URL=postgresql+…`)
   and put the app behind the intranet SSO/reverse proxy.
 - Auth is isolated (`auth/`) to keep a clear **LDAP/AD/SSO** integration path.
+
+---
+
+## Building the Windows `.exe`
+
+A standalone, double-click `.exe` for machines without Python installed —
+useful for a non-technical operator's laptop, or a coordinator machine
+running the one shared instance everyone else reaches over the intranet
+(pick either deployment model; the `.exe` itself doesn't force one — see
+`MAILBOX_OPS_BIND_HOST` below).
+
+**This has to be built ON Windows.** PyInstaller does not cross-compile —
+running the build on Linux/macOS produces a Linux/macOS binary, not a
+`.exe`. From a Windows machine with Python 3.11+ installed:
+
+```bat
+build_exe.bat
+```
+
+This creates a clean build venv, installs dependencies + PyInstaller, and
+produces `dist\MailboxOpsDashboard.exe` — a single ~120MB file with the
+Python interpreter and every dependency (Streamlit, pandas, SQLAlchemy,
+etc.) bundled in. **Nothing needs installing on the target machine** —
+no Python, no `pip install`, and therefore no risk of a user installing an
+incompatible package version, since they never touch that layer at all.
+`build_exe.sh` runs the same spec on Linux/macOS for local testing only
+(still not a `.exe`).
+
+**Design choice — no native app window.** The `.exe` starts the dashboard
+server and opens it in the user's **default browser**, rather than wrapping
+it in a native window (the `pywebview` approach evaluated earlier). That
+alternative needs the Microsoft Edge WebView2 runtime — present by default
+on current Windows 10/11, but a real gap on an older or locked-down
+government image, and not something bundling can fix since it's an OS
+component, not a Python package. Opening the default browser needs nothing
+beyond what every Windows install already has. The tradeoff: it looks like
+a browser tab, not a standalone app window.
+
+**Where data lives.** The SQLite database, raw email store, and `.env` all
+live in a `data/` folder **next to the `.exe`**, not inside it — verified
+against an actual built binary, not assumed: `config/settings.py` detects
+the frozen state and resolves paths from `sys.executable`'s directory
+(stable across runs), never from PyInstaller's temp extraction directory
+(wiped after every run, which would otherwise silently reset the database
+every single launch). Copy `.env.example` next to the `.exe`, rename it to
+`.env`, and fill in what's needed before first login — same non-secret
+settings as ever (IMAP host/domains/thresholds are also editable post-setup
+under Admin → Settings, per the runtime-settings feature above).
+
+**One vs. many people.** `MAILBOX_OPS_BIND_HOST` (unset by default, meaning
+`127.0.0.1`) controls this without needing a different build:
+- Default (`127.0.0.1`) — this machine only. Right for a single analyst's
+  personal standalone copy.
+- Set to `0.0.0.0` or the machine's LAN IP — a shared central instance,
+  reachable by others over the intranet at `http://<that-ip>:8501`. Right
+  for the "one shared instance, everyone else uses a browser" model the
+  RBAC/audit design assumes.
+
+**First launch is slower** (a few seconds) — `--onefile` mode re-extracts
+the bundle to a temp directory on every run; subsequent page loads are
+normal speed. **Unsigned-exe warnings** (Windows SmartScreen / Defender)
+are normal for PyInstaller output without a code-signing certificate —
+resolve via an internal IT allowlist entry or an org code-signing cert if
+available, not by disabling protections.
 
 ---
 

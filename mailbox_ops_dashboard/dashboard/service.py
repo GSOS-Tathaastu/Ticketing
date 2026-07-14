@@ -13,14 +13,16 @@ from db.models import (
     AuditLog,
     Email,
     InternalNote,
+    RequestingEntity,
     SyncRun,
     Ticket,
     TicketAgent,
     TicketEvent,
     User,
 )
-from tickets import sla_engine, status_engine
+from tickets import sla_engine, stage_detection_engine, status_engine
 from tickets.agent_detection_engine import UNKNOWN_AGENT_LABEL
+from tickets.entity_detection_engine import ONBOARDING_CATEGORY
 from tickets.ticket_builder import rebuild_tickets
 
 
@@ -74,6 +76,43 @@ def ticket_notes(session: Session, ticket_id: int) -> list[InternalNote]:
 
 def internal_users(session: Session) -> list[User]:
     return session.query(User).filter(User.internal.is_(True)).order_by(User.name).all()
+
+
+# --------------------------------------------------------------------------- #
+# Requesting entities — AUA/KUA onboarding extension (DESIGN.md §13)
+# --------------------------------------------------------------------------- #
+def list_entities(session: Session) -> list[RequestingEntity]:
+    return session.query(RequestingEntity).order_by(RequestingEntity.name).all()
+
+
+def get_entity(session: Session, entity_id: int) -> RequestingEntity | None:
+    return session.get(RequestingEntity, entity_id)
+
+
+def entity_tickets(session: Session, entity_id: int) -> list[Ticket]:
+    return session.query(Ticket).filter_by(requesting_entity_id=entity_id).order_by(
+        Ticket.created_at.desc()).all()
+
+
+def onboarding_overview(session: Session) -> list[dict]:
+    """One row per entity that has ever had onboarding correspondence, with
+    its current onboarding ticket's stage — the 'visual stage completion'
+    view (DESIGN.md §13.4)."""
+    rows = []
+    for ent in list_entities(session):
+        tickets = entity_tickets(session, ent.id)
+        onboarding = [t for t in tickets if t.category == ONBOARDING_CATEGORY]
+        current = next((t for t in onboarding if t.manual_status not in {"Resolved", "Closed"}), None)
+        current = current or (onboarding[0] if onboarding else None)
+        if not tickets:
+            continue
+        rows.append({
+            "entity": ent, "current_onboarding_ticket": current,
+            "stage": (current.manual_onboarding_stage or current.inferred_onboarding_stage) if current else None,
+            "other_ticket_count": len(tickets) - (1 if current else 0),
+            "total_tickets": len(tickets),
+        })
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -387,6 +426,59 @@ def correct_detected_agent(session: Session, user: User, event: TicketEvent,
                                     last_action_at=event.sent_at))
     write_audit(session, user=user, action_type="correct_detected_agent", entity_type="ticket_event",
                 entity_id=event.id, old_value=old, new_value={"email": email, "name": name})
+
+
+def create_or_update_entity(session: Session, user: User, entity_id: int | None = None,
+                            **fields) -> RequestingEntity:
+    require(user, "manage_onboarding")
+    if entity_id:
+        ent = session.get(RequestingEntity, entity_id)
+        if ent is None:
+            raise ValueError(f"Entity {entity_id} not found")
+        old = {k: getattr(ent, k) for k in fields}
+        for k, v in fields.items():
+            setattr(ent, k, v)
+        write_audit(session, user=user, action_type="update_entity", entity_type="requesting_entity",
+                    entity_id=entity_id, old_value=old, new_value=fields)
+    else:
+        ent = RequestingEntity(**fields)
+        session.add(ent)
+        session.flush()
+        write_audit(session, user=user, action_type="create_entity", entity_type="requesting_entity",
+                    entity_id=ent.id, new_value=fields)
+    return ent
+
+
+def link_ticket_to_entity(session: Session, user: User, ticket: Ticket, entity_id: int | None) -> None:
+    """Manual correction path when entity auto-detection missed or misfired
+    (mirrors the 'Unknown internal agent' correction pattern)."""
+    require(user, "manage_onboarding")
+    old = ticket.requesting_entity_id
+    ticket.requesting_entity_id = entity_id
+    write_audit(session, user=user, action_type="link_entity", entity_type="ticket",
+                entity_id=ticket.ticket_id, old_value=old, new_value=entity_id)
+
+
+def set_manual_onboarding_stage(session: Session, user: User, ticket: Ticket, stage: str | None) -> None:
+    require(user, "manage_onboarding")
+    old = ticket.manual_onboarding_stage
+    ticket.manual_onboarding_stage = stage
+    ticket.onboarding_stage_override_flag = stage_detection_engine.stage_mismatch(
+        ticket.inferred_onboarding_stage, stage)
+    session.add(TicketEvent(ticket_id=ticket.id, event_kind="status_change", from_name=user.email,
+                            subject=f"Onboarding stage → {stage}", sent_at=_now()))
+    write_audit(session, user=user, action_type="set_manual_onboarding_stage", entity_type="ticket",
+                entity_id=ticket.ticket_id, old_value=old, new_value=stage)
+
+
+def link_previous_attempt(session: Session, user: User, ticket: Ticket, previous_ticket_id: int | None) -> None:
+    """A re-application always gets a NEW ticket (DESIGN.md §13.7) — this just
+    points it back at the earlier attempt for continuity."""
+    require(user, "manage_onboarding")
+    old = ticket.related_previous_ticket_id
+    ticket.related_previous_ticket_id = previous_ticket_id
+    write_audit(session, user=user, action_type="link_previous_attempt", entity_type="ticket",
+                entity_id=ticket.ticket_id, old_value=old, new_value=previous_ticket_id)
 
 
 def audit_logs(session: Session, limit: int = 200) -> list[AuditLog]:

@@ -20,6 +20,7 @@ PERM = {
     "configure_sla",
     "manage_users",
     "view_audit_logs",
+    "manage_onboarding",        # requesting-entity linking, onboarding stage, re-application links
 }
 
 ROLES: dict[str, set[str]] = {
@@ -28,7 +29,7 @@ ROLES: dict[str, set[str]] = {
         "view_dashboards", "view_tickets", "drilldown_tickets",
         "assign_owner", "edit_contributing_agents", "correct_detected_agent",
         "edit_ticket_fields", "set_manual_status", "add_note", "add_closure_note",
-        "view_audit_logs",
+        "view_audit_logs", "manage_onboarding",
     },
     "senior_viewer": {  # leadership, read-only
         "view_dashboards", "view_tickets", "drilldown_tickets",

@@ -91,9 +91,11 @@ mailbox_ops_dashboard/
 │   ├── ticket_builder.py           # emails → tickets + timeline events
 │   ├── status_engine.py            # rule-based inferred_status
 │   ├── sla_engine.py               # SLA + ageing buckets
-│   └── agent_detection_engine.py   # ordered signal cascade + Unknown-agent
+│   ├── agent_detection_engine.py   # ordered signal cascade + Unknown-agent
+│   ├── entity_detection_engine.py  # AUA/KUA requesting-entity cascade (DESIGN.md §13)
+│   └── stage_detection_engine.py   # AUA/KUA onboarding-stage keyword cascade
 ├── dashboard/
-│   ├── app.py                      # Streamlit UI (login, RBAC, dashboards A–G, drill-down)
+│   ├── app.py                      # Streamlit UI (login, RBAC, dashboards A–H, drill-down)
 │   └── service.py                  # read/write service layer (RBAC + audit)
 ├── db/
 │   ├── models.py                   # SQLAlchemy schema (SQLite→Postgres)
@@ -130,12 +132,18 @@ PostgreSQL. Core tables:
 - **audit_logs** — every manual mutation (`old_value` → `new_value`)
 - **sla_rules** — per-priority/category due-hours + at-risk window
 - **sync_runs** — per-ingestion stats (Data-Quality dashboard)
+- **requesting_entities** — AUA/KUA/Sub-AUA/Sub-KUA onboarding extension
+  (DESIGN.md §13): entity identity (CIN/PAN/TAN/GSTIN, type, sponsoring
+  parent for Sub-AUA/Sub-KUA), a join key across tickets — not a case/workflow
+  object. `tickets`/`emails` gain `requesting_entity_id`;
+  `tickets` also gain `inferred_onboarding_stage` / `manual_onboarding_stage`
+  / `related_previous_ticket_id`; `ticket_events` gains `document_type`.
 
 Full column lists are in [`db/models.py`](db/models.py).
 
 ---
 
-## Dashboards (A–G)
+## Dashboards (A–H)
 
 Login-gated, role-aware. Every mutation is permission-checked **at the service
 layer** and written to the audit log.
@@ -164,6 +172,14 @@ layer** and written to the audit log.
 - **G · Mailbox Sync & Data Quality** — last sync, processed/failed/dup today,
   unmapped emails, ownerless tickets, unclear status, outbound replies +
   unknown-agent count, multi-agent ambiguity, **current ingestion mode**.
+- **H · AUA/KUA Onboarding** *(DESIGN.md §13)* — one row per requesting
+  entity with a visual stage stepper (Application Submitted → Agreement &
+  In-Principle Approval → Audit/Compliance Certification → Pre-Production
+  Testing → Production Go-Live) and a count of the entity's other tickets
+  (Annual Audit / Other, kept separate per cycle). The drill-down page shows
+  the same entity card, stage stepper, and a document-reference index
+  (pointers back to the source email — no document store) whenever a ticket
+  is entity-linked.
 
 *(This is a Streamlit MVP: charts are native bar charts + metric tiles. The
 drill-down uses `st.expander` sections for the expand/collapse requirement.)*
@@ -292,6 +308,12 @@ optional & local · backend-enforced RBAC · full audit trail of manual actions.
 - Streamlit MVP UI (functional, not pixel-polished); charts are native.
 - No email **sending** from the dashboard by design — agents keep replying from
   the mailbox.
+- **AUA/KUA entity/stage detection** (DESIGN.md §13) is a keyword cascade over
+  the same public UIDAI process documents, not real correspondence samples —
+  tune the patterns in `entity_detection_engine.py`/`stage_detection_engine.py`
+  once real onboarding emails are available. Never trusted silently: a
+  supervisor can always relink the entity or set the stage manually, and
+  reaching the final stage never auto-closes the ticket.
 
 ---
 

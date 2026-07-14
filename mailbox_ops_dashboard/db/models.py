@@ -43,6 +43,32 @@ class User(Base):
 
 
 # --------------------------------------------------------------------------- #
+# Requesting entity (AUA/KUA/Sub-AUA/Sub-KUA onboarding extension) — a light
+# identity join key across tickets, NOT a case/workflow object. See
+# DESIGN.md §13.
+# --------------------------------------------------------------------------- #
+class RequestingEntity(Base):
+    __tablename__ = "requesting_entities"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False)
+    entity_type = Column(String(16))  # aua|kua|sub_aua|sub_kua|other
+    cin = Column(String(32))
+    pan = Column(String(16))
+    tan = Column(String(16))
+    gstin = Column(String(20))
+    registration_number = Column(String(64))
+    parent_entity_id = Column(Integer, ForeignKey("requesting_entities.id"))  # Sub-AUA/Sub-KUA sponsor
+    known_domains = Column(String(512))       # comma-separated
+    primary_contact_email = Column(String(320))
+    auto_created = Column(Boolean, default=False)  # discovered from content vs. registered manually
+    notes = Column(Text)
+    created_at = Column(DateTime, default=_utcnow)
+
+    parent_entity = relationship("RequestingEntity", remote_side=[id])
+
+
+# --------------------------------------------------------------------------- #
 # Normalized email  (mirrors the NormalizedEmail contract 1:1)
 # --------------------------------------------------------------------------- #
 class Email(Base):
@@ -92,6 +118,8 @@ class Email(Base):
     ticket_id = Column(Integer, ForeignKey("tickets.id"), index=True)
     ticket = relationship("Ticket", back_populates="emails")
 
+    requesting_entity_id = Column(Integer, ForeignKey("requesting_entities.id"), index=True)
+
 
 # --------------------------------------------------------------------------- #
 # Ticket
@@ -134,12 +162,21 @@ class Ticket(Base):
     manual_override_flag = Column(Boolean, default=False)  # human edited status
     closure_note = Column(Text)
 
+    # --- AUA/KUA onboarding extension (DESIGN.md §13) --------------------
+    requesting_entity_id = Column(Integer, ForeignKey("requesting_entities.id"), index=True)
+    related_previous_ticket_id = Column(Integer, ForeignKey("tickets.id"))  # prior attempt, if re-applied
+    inferred_onboarding_stage = Column(String(48))    # set by stage_detection_engine
+    manual_onboarding_stage = Column(String(48))       # human-settable, kept separate
+    onboarding_stage_override_flag = Column(Boolean, default=False)
+
     emails = relationship("Email", back_populates="ticket")
     events = relationship("TicketEvent", back_populates="ticket", order_by="TicketEvent.sent_at")
     agents = relationship("TicketAgent", back_populates="ticket")
     notes = relationship("InternalNote", back_populates="ticket", order_by="InternalNote.created_at")
 
     primary_owner = relationship("User", foreign_keys=[primary_owner_user_id])
+    requesting_entity = relationship("RequestingEntity", foreign_keys=[requesting_entity_id])
+    related_previous_ticket = relationship("Ticket", remote_side=[id], foreign_keys=[related_previous_ticket_id])
 
 
 # --------------------------------------------------------------------------- #
@@ -176,6 +213,9 @@ class TicketEvent(Base):
     detected_agent_name = Column(String(255))
     detected_agent_source = Column(String(32))
     detected_agent_confidence = Column(String(16))
+
+    # AUA/KUA onboarding extension: a pointer, not a document store (DESIGN.md §13.5)
+    document_type = Column(String(32))  # application_form|agreement|in_principle_letter|audit_report|other
 
     created_at = Column(DateTime, default=_utcnow)
 

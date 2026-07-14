@@ -265,3 +265,123 @@ LDAP/AD/SSO auth · NIC IMAP/POP/API live sync from VPN · FastAPI+React UI ·
 Postgres · mbox/PST importers · attachment text indexing · configurable
 SLA per category/department · email-send-back from dashboard · notification
 digests · per-team routing rules.
+
+---
+
+## 13. AUA/KUA/Sub-AUA/Sub-KUA Onboarding Extension
+
+UIDAI's AUA/KUA/Sub-AUA/Sub-KUA onboarding process (application → agreement →
+in-principle approval → security/compliance audit → pre-production testing →
+production go-live → recurring annual audits) spans months per applicant
+across multiple, otherwise-unrelated-looking email threads. A single email
+thread is not the right unit of work for it — this section extends the core
+ticket model rather than replacing it, converged through discussion:
+
+- No new "Case" table with its own workflow-state machine (rejected as
+  over-engineering for this MVP).
+- Instead: entity-identity as the join key across tickets, a lightweight
+  stage detector reusing the existing rule-based detection pattern, and a
+  fixed one-ticket-per-entity rule scoped specifically to onboarding.
+
+### 13.1 Requesting entity
+
+A new `requesting_entities` table: `name`, `entity_type`
+(aua/kua/sub_aua/sub_kua/other), `cin`, `pan`, `tan`, `gstin`,
+`registration_number`, `parent_entity_id` (self-referential — the sponsoring
+parent for a Sub-AUA/Sub-KUA), `known_domains`, `primary_contact_email`,
+`auto_created` (flag for entities discovered from content vs. registered
+manually), `created_at`.
+
+`tickets.requesting_entity_id` and `emails.requesting_entity_id` link into
+it. The ticket drill-down shows "N other tickets for this entity" as a plain
+join/panel — no hierarchy, no workflow engine.
+
+### 13.2 Entity detection cascade (`tickets/entity_detection_engine.py`)
+
+Mirrors the existing agent-detection cascade rather than inventing a new
+pattern:
+1. Known entity by requester email / domain (`known_domains`,
+   `primary_contact_email`) → high confidence.
+2. Regex extraction of a CIN/PAN/TAN/GSTIN-format identifier from the
+   subject/body, matched against existing entities' stored IDs → medium
+   confidence. If no entity has that ID yet and the email is
+   onboarding-classified (§13.3), a minimal entity record is auto-created
+   (`auto_created=True`) so the system is self-bootstrapping rather than
+   requiring pre-registration of every applicant.
+3. No match → ticket stays unlinked; a supervisor links it manually from the
+   drill-down page (mirrors the "Unknown internal agent" correction path).
+
+Runs for **every** email, not just onboarding ones, so cross-category linking
+("this entity also has 2 Annual Audit tickets") works regardless of category.
+
+### 13.3 One ticket per entity for onboarding (`thread_mapper.py`)
+
+`is_onboarding_email()` is a keyword classifier (AUA, KUA, Sub-AUA, Sub-KUA,
+"authentication user agency", "in-principle approval", "pre-production",
+"go-live", etc.) applied at the email level, independent of any existing
+ticket.
+
+This is the one genuinely new piece of core reconstruction logic: after the
+existing Message-ID/subject/requester/window cascade assigns each email's
+`thread_key` (unchanged, still used for every non-onboarding ticket), a new
+folding pass runs for onboarding-classified emails whose entity resolves —
+it **overwrites** `thread_key` to the entity's single open onboarding
+ticket's key (or mints a new canonical key `th_onboarding_<entity_id>` if
+none exists yet), regardless of subject-line differences. This is what makes
+"one entity, one onboarding ticket" hold even when the application email,
+the in-principle-approval email, and the audit-submission email arrive weeks
+apart with completely different subjects.
+
+`category` is auto-set to `"AUA/KUA Onboarding"` only when a new ticket is
+created this way — never overwritten on rebuild, so a supervisor's manual
+reclassification always sticks (same non-destructive-rebuild rule already
+used for owner/status/notes).
+
+### 13.4 Stage detection (`tickets/stage_detection_engine.py`)
+
+Structurally identical to `status_engine.py`: an ordered keyword cascade over
+all of a ticket's email text, producing `inferred_onboarding_stage` from a
+fixed stage list (Application Submitted → Agreement & In-Principle Approval →
+Audit / Compliance Certification → Pre-Production Testing → Production
+Go-Live), shown as a visual stepper. `manual_onboarding_stage` stays a
+separate, human-settable field (mirrors `manual_status`/`inferred_status`),
+with a mismatch flag when they disagree. Same honesty caveat as agent
+detection: keyword matching on real UIDAI correspondence needs tuning against
+actual samples and is not trusted silently — always correctable.
+
+Reaching the final stage does **not** auto-close the ticket. Closing is
+always a manual `set_manual_status` action — a heuristic keyword match is not
+sufficient grounds to change ticket state on its own.
+
+### 13.5 Document reference tagging, not a DMS
+
+`ticket_events.document_type` (application_form / agreement /
+in_principle_letter / audit_report / other) is auto-tagged by the same
+keyword cascade used for stage detection, or set manually. It is a pointer
+back to the email that already carries the content/attachment — no separate
+storage, no versioning. The drill-down shows "Audit report → \[jump to the
+7 Mar email from X\]" instead of a document list.
+
+### 13.6 Category taxonomy
+
+`category` remains the existing free-text field for the general mailbox (so
+"Address Update", "Pension Linkage" etc. are untouched), but the moment a
+ticket is entity-linked, the dashboard's category control becomes a fixed,
+enforced dropdown: **AUA/KUA Onboarding**, **Annual Audit**, **Other
+(AUA/KUA)** — preventing the category dashboard from fragmenting under typos
+or near-duplicate labels for this workflow, without constraining the
+unrelated grievance-ticket categories that were never part of this ask.
+
+### 13.7 Re-application handling
+
+If an entity's onboarding is rejected/withdrawn and they re-apply later, a
+**new** ticket is always created (never reopened) — `related_previous_ticket_id`
+links it back to the earlier attempt so a supervisor pulling up attempt #2
+can jump straight to attempt #1's full history via the entity panel.
+
+### 13.8 Explicitly not changed
+
+Annual Audit and Other tickets remain ordinary, independent tickets — one
+per thread/cycle as today, closing normally, linked to the entity only via
+the FK for cross-reference. No perpetual-reopen state machine, no case
+object spanning tickets, no document storage/versioning.

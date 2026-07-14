@@ -20,10 +20,12 @@ import re
 from sqlalchemy.orm import Session
 
 from config.settings import settings
-from db.models import Email
+from db.models import Email, RequestingEntity, Ticket
+from tickets.entity_detection_engine import ONBOARDING_CATEGORY, detect_entity, is_onboarding_email
 
 _MSGID_RE = re.compile(r"<[^>]+>")
 _WINDOW = dt.timedelta(hours=72)  # subject-match fallback window
+_CLOSED_STATUSES = {"Resolved", "Closed"}
 
 
 class _UnionFind:
@@ -127,7 +129,46 @@ def recompute_thread_keys(session: Session) -> int:
         if e.thread_key != tk:
             e.thread_key = tk
             updated += 1
+
+    updated += _apply_onboarding_entity_folding(session, emails)
     session.flush()
+    return updated
+
+
+def _apply_onboarding_entity_folding(session: Session, emails: list[Email]) -> int:
+    """One entity, one onboarding ticket (DESIGN.md §13.3): for emails that
+    look like AUA/KUA onboarding correspondence and resolve to a requesting
+    entity, redirect thread_key to that entity's single open onboarding
+    ticket, overriding the normal subject/conversation-based grouping above.
+    Entity detection itself still runs for every email (stamping
+    requesting_entity_id) so cross-category linking works regardless of
+    whether folding applies."""
+    known_entities = session.query(RequestingEntity).all()
+    open_onboarding: dict[int, Ticket] = {
+        t.requesting_entity_id: t
+        for t in session.query(Ticket).filter_by(category=ONBOARDING_CATEGORY).all()
+        if t.requesting_entity_id and t.manual_status not in _CLOSED_STATUSES
+    }
+    updated = 0
+    for e in emails:
+        to_emails = json.loads(e.to_emails) if e.to_emails else []
+        entity = detect_entity(
+            session, from_email=e.from_email, subject=e.subject, body=e.body_text,
+            from_name=e.from_name, to_emails=to_emails, known_entities=known_entities,
+            allow_create=is_onboarding_email(e.subject, e.body_text),
+        )
+        if entity is None:
+            continue
+        if e.requesting_entity_id != entity.id:
+            e.requesting_entity_id = entity.id
+            updated += 1
+        if not is_onboarding_email(e.subject, e.body_text):
+            continue
+        existing_ticket = open_onboarding.get(entity.id)
+        canonical = existing_ticket.thread_key if existing_ticket else _thread_key_from(f"onboarding-entity:{entity.id}")
+        if e.thread_key != canonical:
+            e.thread_key = canonical
+            updated += 1
     return updated
 
 

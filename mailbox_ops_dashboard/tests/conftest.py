@@ -33,3 +33,4 @@ def session():
 
 
 SAMPLE_DIR = ROOT / "tests" / "sample_eml"
+SAMPLE_ONBOARDING_DIR = ROOT / "tests" / "sample_eml_onboarding"

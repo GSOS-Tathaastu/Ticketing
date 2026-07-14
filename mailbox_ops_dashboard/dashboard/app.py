@@ -17,12 +17,14 @@ from auth.users import PermissionError_, authenticate  # noqa: E402
 from config.settings import settings  # noqa: E402
 from db.database import get_session, init_db  # noqa: E402
 from dashboard import service as svc  # noqa: E402
-from tickets import sla_engine, status_engine  # noqa: E402
+from tickets import sla_engine, stage_detection_engine, status_engine  # noqa: E402
+from tickets.entity_detection_engine import ENTITY_CATEGORIES  # noqa: E402
 
 st.set_page_config(page_title="Mailbox Operations Dashboard", page_icon="📬", layout="wide")
 
 PRIORITIES = ["low", "normal", "high", "urgent"]
 MANUAL_STATUSES = ["", "Open", "In Progress", "Pending", "Resolved", "Closed"]
+ENTITY_TYPES = ["aua", "kua", "sub_aua", "sub_kua", "other"]
 
 
 # --------------------------------------------------------------------------- #
@@ -136,6 +138,7 @@ def page_work_queue(s):
     rows = []
     for t in tickets:
         owner = omap.get(t.primary_owner_user_id)
+        entity = svc.get_entity(s, t.requesting_entity_id) if t.requesting_entity_id else None
         last_from = "—"
         if t.last_customer_email_at and t.last_agent_email_at:
             last_from = "customer" if svc._aware(t.last_customer_email_at) >= svc._aware(t.last_agent_email_at) else "agent"
@@ -145,7 +148,8 @@ def page_work_queue(s):
             last_from = "agent"
         rows.append({
             "PK": t.id, "Ticket ID": t.ticket_id, "Subject": (t.subject or "")[:60],
-            "Requester": t.requester_email, "Primary owner": owner.name if owner else "—",
+            "Requester": t.requester_email, "Entity": entity.name if entity else "—",
+            "Primary owner": owner.name if owner else "—",
             "Contrib.": svc.contributor_count(s, t.id), "Last action by": t.last_action_by_label or "—",
             "Department": t.department or "—", "Category": t.category or "—",
             "Manual status": t.manual_status or "—", "Inferred status": t.inferred_status or "—",
@@ -219,7 +223,7 @@ def page_work_queue(s):
             df = df[df["PK"].isin(keep)]
 
     st.caption(f"{len(df)} ticket(s)")
-    display_cols = ["Ticket ID", "Subject", "Requester", "Primary owner", "Contrib.",
+    display_cols = ["Ticket ID", "Subject", "Requester", "Entity", "Primary owner", "Contrib.",
                     "Last action by", "Department", "Category", "Manual status",
                     "Inferred status", "Pending with", "Priority", "Ageing (d)",
                     "Last email from", "Last email", "SLA", "Action needed"]
@@ -303,6 +307,10 @@ def page_drilldown(s):
             st.warning(f"⚠️ Status mismatch: inferred **{ticket.inferred_status}** "
                        f"but manual status is **{ticket.manual_status}**.")
 
+    # AUA/KUA onboarding extension (DESIGN.md §13) ------------------------
+    if ticket.requesting_entity_id:
+        _render_entity_section(s, ticket)
+
     # 3 · Action summary -------------------------------------------------
     with st.expander("Action summary", expanded=True):
         cust_followups = sum(1 for e in events if e.direction == "inbound") - 1
@@ -335,6 +343,64 @@ def page_drilldown(s):
 
     # Edit panel (permission-gated) --------------------------------------
     _edit_panel(s, ticket, omap, events)
+
+
+def _render_entity_section(s, ticket):
+    """AUA/KUA onboarding extension (DESIGN.md §13): entity identity, other
+    tickets for this entity, the visual stage stepper, and a document
+    reference index — no case object, no document store, just joins and a
+    keyword-cascade stepper over the same ticket data."""
+    from tickets.entity_detection_engine import ONBOARDING_CATEGORY
+
+    ent = svc.get_entity(s, ticket.requesting_entity_id)
+    if ent is None:
+        return
+    with st.expander("🏢 AUA/KUA Onboarding — Requesting Entity", expanded=True):
+        c = st.columns(3)
+        c[0].markdown(f"**Entity:** {ent.name}")
+        c[0].markdown(f"**Type:** {ent.entity_type or '—'}" + (" (auto-detected)" if ent.auto_created else ""))
+        if ent.parent_entity_id:
+            parent = svc.get_entity(s, ent.parent_entity_id)
+            c[0].markdown(f"**Sponsoring parent:** {parent.name if parent else '—'}")
+        c[1].markdown(f"**CIN:** {ent.cin or '—'}")
+        c[1].markdown(f"**PAN:** {ent.pan or '—'}")
+        c[2].markdown(f"**TAN:** {ent.tan or '—'}")
+        c[2].markdown(f"**GSTIN:** {ent.gstin or '—'}")
+
+        others = [t for t in svc.entity_tickets(s, ent.id) if t.id != ticket.id]
+        st.markdown(f"**Other tickets for this entity:** {len(others)}")
+        if others:
+            st.dataframe(pd.DataFrame([{
+                "Ticket ID": t.ticket_id, "Category": t.category or "—",
+                "Subject": (t.subject or "")[:60], "Status": t.manual_status or t.inferred_status or "—",
+                "Created": _fmt(t.created_at),
+            } for t in others]), use_container_width=True, hide_index=True)
+
+        if ticket.related_previous_ticket_id:
+            prev = svc.get_ticket(s, ticket.related_previous_ticket_id)
+            if prev:
+                st.info(f"🔗 Related to an earlier attempt: **{prev.ticket_id}** — {prev.subject}")
+
+        if ticket.category == ONBOARDING_CATEGORY:
+            st.markdown("**Onboarding stage:**")
+            stage = ticket.manual_onboarding_stage or ticket.inferred_onboarding_stage
+            idx = stage_detection_engine.STAGES.index(stage) if stage in stage_detection_engine.STAGES else -1
+            steps = " → ".join(
+                (f"✅ {s_}" if i <= idx else f"⬜ {s_}") for i, s_ in enumerate(stage_detection_engine.STAGES))
+            st.markdown(steps)
+            st.caption(f"Inferred: {ticket.inferred_onboarding_stage or '—'} · "
+                       f"Manual: {ticket.manual_onboarding_stage or '—'}")
+            if ticket.onboarding_stage_override_flag:
+                st.warning(f"⚠️ Stage mismatch: inferred **{ticket.inferred_onboarding_stage}** "
+                           f"but manual stage is **{ticket.manual_onboarding_stage}**.")
+
+        docs = [e for e in svc.ticket_events(s, ticket.id) if e.document_type]
+        if docs:
+            st.markdown("**Document references** _(pointers to the source email — no separate storage)_")
+            st.dataframe(pd.DataFrame([{
+                "Document": d.document_type, "Date": _fmt(d.sent_at),
+                "From": d.from_name or d.from_email, "Subject": (d.subject or "")[:60],
+            } for d in docs]), use_container_width=True, hide_index=True)
 
 
 def _render_event(s, e):
@@ -371,14 +437,18 @@ def _render_event(s, e):
 def _edit_panel(s, ticket, omap, events):
     u = current_user()
     editable = any(can(p) for p in ("assign_owner", "edit_ticket_fields", "set_manual_status",
-                                    "add_note", "edit_contributing_agents", "correct_detected_agent"))
+                                    "add_note", "edit_contributing_agents", "correct_detected_agent",
+                                    "manage_onboarding"))
     if not editable:
         st.info("You have read-only access to this ticket.")
         return
     st.subheader("Manage ticket")
     uo = UserObj(u)
     internal = svc.internal_users(s)
-    tabs = st.tabs(["Owner & fields", "Status & notes", "Agents"])
+    tab_labels = ["Owner & fields", "Status & notes", "Agents"]
+    if can("manage_onboarding"):
+        tab_labels.append("AUA/KUA Onboarding")
+    tabs = st.tabs(tab_labels)
 
     with tabs[0]:
         if can("assign_owner"):
@@ -390,7 +460,13 @@ def _edit_panel(s, ticket, omap, events):
         if can("edit_ticket_fields"):
             c = st.columns(3)
             dept = c[0].text_input("Department", ticket.department or "")
-            cat = c[1].text_input("Category", ticket.category or "")
+            # Fixed, enforced category list once a ticket is entity-linked
+            # (DESIGN.md §13.6) — free text everywhere else.
+            if ticket.requesting_entity_id:
+                cur_cat = ticket.category if ticket.category in ENTITY_CATEGORIES else ENTITY_CATEGORIES[0]
+                cat = c[1].selectbox("Category", ENTITY_CATEGORIES, index=ENTITY_CATEGORIES.index(cur_cat))
+            else:
+                cat = c[1].text_input("Category", ticket.category or "")
             prio = c[2].selectbox("Priority", PRIORITIES, index=PRIORITIES.index(ticket.priority or "normal"))
             if st.button("Save fields"):
                 _mutate(s, lambda ss: svc.set_ticket_fields(ss, uo, svc.get_ticket(ss, ticket.id),
@@ -433,6 +509,37 @@ def _edit_panel(s, ticket, omap, events):
                     eid = emap[pick]
                     _mutate(s, lambda ss: svc.correct_detected_agent(
                         ss, uo, svc.get_event(ss, eid), ce.strip() or None, cn.strip() or None))
+
+    if can("manage_onboarding"):
+        with tabs[3]:
+            entities = svc.list_entities(s)
+            eopts = {"— not linked —": None} | {f"{x.name} (id={x.id})": x.id for x in entities}
+            ecur = next((k for k, v in eopts.items() if v == ticket.requesting_entity_id), "— not linked —")
+            esel = st.selectbox("Requesting entity", list(eopts), index=list(eopts).index(ecur))
+            if st.button("Save entity link"):
+                _mutate(s, lambda ss: svc.link_ticket_to_entity(
+                    ss, uo, svc.get_ticket(ss, ticket.id), eopts[esel]))
+
+            if ticket.requesting_entity_id:
+                stage_opts = [""] + stage_detection_engine.STAGES
+                cur_stage = ticket.manual_onboarding_stage or ""
+                stage_sel = st.selectbox("Manual onboarding stage", stage_opts,
+                                         index=stage_opts.index(cur_stage) if cur_stage in stage_opts else 0)
+                if st.button("Save onboarding stage"):
+                    _mutate(s, lambda ss: svc.set_manual_onboarding_stage(
+                        ss, uo, svc.get_ticket(ss, ticket.id), stage_sel or None))
+
+                st.divider()
+                st.caption("Re-application (DESIGN.md §13.7): always a new ticket — link it to the prior attempt.")
+                same_entity_tickets = [t for t in svc.entity_tickets(s, ticket.requesting_entity_id)
+                                       if t.id != ticket.id]
+                popts = {"— none —": None} | {f"{t.ticket_id} — {(t.subject or '')[:40]}": t.id
+                                              for t in same_entity_tickets}
+                pcur = next((k for k, v in popts.items() if v == ticket.related_previous_ticket_id), "— none —")
+                psel = st.selectbox("Related previous attempt", list(popts), index=list(popts).index(pcur))
+                if st.button("Save related attempt"):
+                    _mutate(s, lambda ss: svc.link_previous_attempt(
+                        ss, uo, svc.get_ticket(ss, ticket.id), popts[psel]))
 
 
 def _mutate(_s, fn):
@@ -552,6 +659,40 @@ def page_data_quality(s):
 
 
 # --------------------------------------------------------------------------- #
+# Dashboard H — AUA/KUA Onboarding (DESIGN.md §13)
+# --------------------------------------------------------------------------- #
+def page_onboarding(s):
+    st.header("H · AUA/KUA Onboarding")
+    st.caption("One ticket per entity for onboarding; Annual Audit / Other tickets stay separate "
+              "per cycle, linked only via the requesting entity.")
+    rows = svc.onboarding_overview(s)
+    if not rows:
+        st.info("No entity-linked tickets yet. Entities are detected automatically from onboarding "
+               "correspondence, or can be created under Admin → Entities.")
+        return
+    for r in rows:
+        ent, ticket = r["entity"], r["current_onboarding_ticket"]
+        with st.container(border=True):
+            c = st.columns([2, 3, 1])
+            c[0].markdown(f"**{ent.name}**  \n`{ent.entity_type or '—'}`" +
+                         (" · auto-detected" if ent.auto_created else ""))
+            if ticket:
+                idx = (stage_detection_engine.STAGES.index(r["stage"])
+                      if r["stage"] in stage_detection_engine.STAGES else -1)
+                steps = " → ".join(
+                    ("✅" if i <= idx else "⬜") for i in range(len(stage_detection_engine.STAGES)))
+                c[1].markdown(f"{steps}  \n{r['stage'] or 'Onboarding correspondence detected, no stage matched yet'}")
+                c[1].caption(f"Ticket {ticket.ticket_id} · {ticket.manual_status or ticket.inferred_status or '—'}")
+            else:
+                c[1].caption("No onboarding-category ticket yet — only Annual Audit / Other tickets on file.")
+            c[2].metric("Other tickets", r["other_ticket_count"])
+            if ticket and can("drilldown_tickets") and st.button("Open", key=f"open_{ent.id}"):
+                st.session_state["active_ticket"] = ticket.id
+                st.session_state["nav"] = "C · Ticket Drill-Down"
+                st.rerun()
+
+
+# --------------------------------------------------------------------------- #
 # Manual ingest (MODE 3)
 # --------------------------------------------------------------------------- #
 def page_manual_ingest(s):
@@ -590,7 +731,7 @@ def page_admin(s):
     st.header("Admin")
     from db.models import SlaRule, User
 
-    tabs = st.tabs(["Users", "SLA rules", "Config"])
+    tabs = st.tabs(["Users", "SLA rules", "Entities", "Config"])
     with tabs[0]:
         st.subheader("Users")
         users = s.query(User).all()
@@ -631,6 +772,46 @@ def page_admin(s):
         } for r in rules]), use_container_width=True, hide_index=True)
         st.caption("Edit SLA thresholds via .env defaults or extend here in a future iteration.")
     with tabs[2]:
+        st.subheader("Requesting entities (AUA/KUA onboarding extension)")
+        entities = svc.list_entities(s)
+        if entities:
+            st.dataframe(pd.DataFrame([{
+                "Name": e.name, "Type": e.entity_type, "CIN": e.cin, "PAN": e.pan,
+                "TAN": e.tan, "GSTIN": e.gstin, "Domains": e.known_domains,
+                "Auto-detected": e.auto_created,
+            } for e in entities]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No entities yet — created automatically from onboarding correspondence, "
+                      "or manually below.")
+        if can("manage_onboarding"):
+            with st.form("new_entity"):
+                st.markdown("**Register an entity**")
+                c = st.columns(3)
+                name = c[0].text_input("Name")
+                etype = c[1].selectbox("Type", ENTITY_TYPES)
+                domains = c[2].text_input("Known domains (comma-separated)")
+                c = st.columns(4)
+                cin = c[0].text_input("CIN")
+                pan = c[1].text_input("PAN")
+                tan = c[2].text_input("TAN")
+                gstin = c[3].text_input("GSTIN")
+                if st.form_submit_button("Create") and name:
+                    ss = get_session()
+                    try:
+                        svc.create_or_update_entity(
+                            ss, UserObj(current_user()), name=name, entity_type=etype,
+                            known_domains=domains or None, cin=cin or None, pan=pan or None,
+                            tan=tan or None, gstin=gstin or None)
+                        ss.commit()
+                        st.success(f"Created {name}")
+                    except Exception as exc:  # noqa: BLE001
+                        ss.rollback()
+                        st.error(str(exc))
+                    finally:
+                        ss.close()
+                    st.rerun()
+
+    with tabs[3]:
         st.subheader("Configuration (read-only view of .env-derived settings)")
         st.json({
             "database_url": settings.database_url,
@@ -688,6 +869,7 @@ PAGES = [
     ("E · Owner / Team Performance", "view_dashboards", page_owner_perf),
     ("F · Category / Request Type", "view_dashboards", page_category),
     ("G · Mailbox Sync & Data Quality", "view_dashboards", page_data_quality),
+    ("H · AUA/KUA Onboarding", "view_dashboards", page_onboarding),
     ("Manual ingest", "configure_ingestion", page_manual_ingest),
     ("Admin", "manage_users", page_admin),
     ("Audit log", "view_audit_logs", page_audit),

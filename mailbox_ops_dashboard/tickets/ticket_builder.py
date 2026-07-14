@@ -11,12 +11,13 @@ from sqlalchemy.orm import Session
 
 from config.settings import settings
 from db.models import Email, Ticket, TicketAgent, TicketEvent, User
-from tickets import sla_engine, status_engine
+from tickets import sla_engine, status_engine, stage_detection_engine
 from tickets.agent_detection_engine import (
     UNKNOWN_AGENT_LABEL,
     detect_agent,
     resolve_direction,
 )
+from tickets.entity_detection_engine import ONBOARDING_CATEGORY, is_onboarding_email
 from tickets.thread_mapper import recompute_thread_keys
 
 
@@ -86,6 +87,17 @@ def _build_one_ticket(session: Session, thread_key: str, emails: list[Email], kn
     ticket.requester_name = req_name
     if is_new:
         ticket.created_at = emails[0].sent_at or dt.datetime.now(dt.timezone.utc)
+        # AUA/KUA onboarding extension (DESIGN.md §13.1/§13.3): entity linking
+        # applies to ANY new ticket the entity is party to (so "5 other
+        # tickets for this entity" works regardless of category) — the
+        # Onboarding category default is the narrower case, only for tickets
+        # that are actually onboarding-classified. Never overwritten on later
+        # rebuilds so a supervisor's manual reclassification always sticks.
+        entity_id = next((e.requesting_entity_id for e in emails if e.requesting_entity_id), None)
+        if entity_id:
+            ticket.requesting_entity_id = entity_id
+            if any(is_onboarding_email(e.subject, e.body_text) for e in emails):
+                ticket.category = ONBOARDING_CATEGORY
 
     # link emails to ticket
     for e in emails:
@@ -125,6 +137,7 @@ def _build_one_ticket(session: Session, thread_key: str, emails: list[Email], kn
             sent_at=e.sent_at, received_at=e.received_at, folder=e.folder,
             has_attachment=e.has_attachments, attachment_metadata=e.attachment_metadata,
             detected_action_type=action_type,
+            document_type=stage_detection_engine.classify_document(e.subject, e.body_text),
             **det.as_dict(),
         )
         session.add(ev)
@@ -195,6 +208,14 @@ def _build_one_ticket(session: Session, thread_key: str, emails: list[Email], kn
     ticket.last_action_by_label = last_action_label
     ticket.is_escalated = escalated
     ticket.is_reopened = reopened
+
+    # AUA/KUA onboarding extension (DESIGN.md §13.4): stage inference stays
+    # separate from manual_onboarding_stage, same pattern as status.
+    if ticket.requesting_entity_id:
+        ticket.inferred_onboarding_stage = stage_detection_engine.infer_stage(
+            [e.body_text or e.body_snippet or "" for e in emails])
+        ticket.onboarding_stage_override_flag = stage_detection_engine.stage_mismatch(
+            ticket.inferred_onboarding_stage, ticket.manual_onboarding_stage)
 
     last = emails[-1]
     resolved_before_last_customer = bool(

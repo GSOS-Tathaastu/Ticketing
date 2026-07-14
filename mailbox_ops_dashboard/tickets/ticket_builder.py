@@ -158,8 +158,28 @@ def _build_one_ticket(session: Session, thread_key: str, emails: list[Email], kn
                 agg["user_id"] = u.id
             last_action_label = det.name or (det.email or UNKNOWN_AGENT_LABEL)
 
-    # persist contributing agents
+    # persist contributing agents. ticket_agents is unique on (ticket_id,
+    # agent_email) — not on role — so an agent who is also the manually
+    # assigned owner (surviving the contributor-only delete above) must be
+    # refreshed in place rather than inserted again as a second row.
+    existing_by_email = {
+        a.agent_email.lower(): a
+        for a in session.query(TicketAgent).filter_by(ticket_id=ticket.id).all()
+        if a.agent_email
+    }
     for agg in agent_agg.values():
+        existing = existing_by_email.get(agg["email"].lower()) if agg["email"] else None
+        if existing:
+            existing.action_count = agg["count"]
+            existing.last_action_at = agg["last"]
+            if existing.user_id is None:
+                existing.user_id = agg["user_id"]
+            if existing.role != "owner":  # owner keeps its manual detection markers
+                existing.role = "contributor"
+                existing.agent_name = agg["name"]
+                existing.detection_source = agg["source"]
+                existing.detection_confidence = agg["confidence"]
+            continue
         session.add(TicketAgent(
             ticket_id=ticket.id, user_id=agg["user_id"], agent_email=agg["email"],
             agent_name=agg["name"], role="contributor", detection_source=agg["source"],

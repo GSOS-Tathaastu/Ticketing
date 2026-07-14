@@ -270,14 +270,24 @@ def assign_owner(session: Session, user: User, ticket: Ticket, new_owner_id: int
     require(user, "assign_owner")
     old = ticket.primary_owner_user_id
     ticket.primary_owner_user_id = new_owner_id
-    # keep a matching owner row in ticket_agents
+
+    # ticket_agents is unique on (ticket_id, agent_email) — not on role — so an
+    # agent already present as an auto-detected contributor must be promoted in
+    # place rather than inserted again. Demote any other "owner" row first so at
+    # most one row carries role="owner" per ticket.
+    for row in session.query(TicketAgent).filter_by(ticket_id=ticket.id, role="owner").all():
+        if new_owner_id is None or row.user_id != new_owner_id:
+            row.role = "contributor"
+
     if new_owner_id:
         u = session.get(User, new_owner_id)
-        existing = session.query(TicketAgent).filter_by(ticket_id=ticket.id, role="owner").first()
+        existing = session.query(TicketAgent).filter_by(ticket_id=ticket.id, agent_email=u.email).first()
         if existing:
             existing.user_id = u.id
-            existing.agent_email = u.email
             existing.agent_name = u.name
+            existing.role = "owner"
+            existing.detection_source = "manual_override"
+            existing.detection_confidence = "high"
         else:
             session.add(TicketAgent(ticket_id=ticket.id, user_id=u.id, agent_email=u.email,
                                     agent_name=u.name, role="owner", detection_source="manual_override",

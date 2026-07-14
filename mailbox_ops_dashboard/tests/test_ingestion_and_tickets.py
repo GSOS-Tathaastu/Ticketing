@@ -1,8 +1,11 @@
 """Integration test: ingest the bundled sample .eml folder and verify tickets,
 threading, timeline, agent detection, and status inference end-to-end."""
-from db.models import Email, Ticket, TicketEvent
+from auth.users import create_user
+from dashboard import service as svc
+from db.models import Email, Ticket, TicketAgent, TicketEvent, User
 from ingestion.export_parser import ingest_export_folder
 from tickets import status_engine
+from tickets.ticket_builder import rebuild_tickets
 
 from tests.conftest import SAMPLE_DIR
 
@@ -50,3 +53,44 @@ def test_reingestion_is_idempotent(session):
     assert stats["duplicates"] >= 5
     # still exactly 2 tickets, no duplicate events
     assert session.query(Ticket).count() == 2
+
+
+def test_assign_owner_to_an_already_detected_contributor(session):
+    """Regression: ticket_agents is unique on (ticket_id, agent_email), not on
+    role. Promoting an agent who was auto-detected as a contributor (e.g. from
+    a Sender header) to primary owner — and then recalculating tickets again —
+    must not attempt a second insert for the same (ticket, email) pair."""
+    ingest_export_folder(session, SAMPLE_DIR)
+    admin = session.query(User).filter_by(email="owner-test-admin@uidai.gov.in").first()
+    if not admin:
+        admin = create_user(session, email="owner-test-admin@uidai.gov.in", name="Admin",
+                            role="admin", password="x", internal=True)
+    rao = session.query(User).filter_by(email="agent.rao@uidai.gov.in").first()
+    if not rao:
+        rao = create_user(session, email="agent.rao@uidai.gov.in", name="Agent Rao",
+                          role="analyst", password="x", internal=True)
+    session.flush()
+
+    addr = next(t for t in session.query(Ticket).all() if "address" in (t.subject or "").lower())
+
+    # Sanity check: rao must already be present as an auto-detected contributor
+    # (from the 04_agent_resolve_named.eml Sender/Reply-To header) for this to
+    # actually exercise the collision.
+    pre = session.query(TicketAgent).filter_by(ticket_id=addr.id, agent_email="agent.rao@uidai.gov.in").first()
+    assert pre is not None and pre.role == "contributor"
+
+    svc.assign_owner(session, admin, addr, rao.id)  # first crash site (fixed)
+    session.flush()
+    assert addr.primary_owner_user_id == rao.id
+
+    rebuild_tickets(session)  # second crash site (fixed)
+    session.flush()
+
+    rows = session.query(TicketAgent).filter_by(ticket_id=addr.id, agent_email="agent.rao@uidai.gov.in").all()
+    assert len(rows) == 1, f"expected exactly one ticket_agents row for rao, got {len(rows)}"
+    assert rows[0].role == "owner"
+    # rao is promoted to owner, so he must not also be double-counted as a
+    # contributor (the thread's other outbound email, from the shared mailbox
+    # with no distinct Sender header, remains a legitimate separate contributor).
+    contributors = session.query(TicketAgent).filter_by(ticket_id=addr.id, role="contributor").all()
+    assert "agent.rao@uidai.gov.in" not in {c.agent_email for c in contributors}

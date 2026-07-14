@@ -10,8 +10,8 @@ import json
 from sqlalchemy.orm import Session
 
 from config.settings import settings
-from db.models import Email, Ticket, TicketAgent, TicketEvent, User
-from tickets import sla_engine, status_engine, stage_detection_engine
+from db.models import Email, InternalNote, Ticket, TicketAgent, TicketEvent, TicketTag, User
+from tickets import automation_engine, sla_engine, status_engine, stage_detection_engine
 from tickets.agent_detection_engine import (
     UNKNOWN_AGENT_LABEL,
     detect_agent,
@@ -54,8 +54,38 @@ def rebuild_tickets(session: Session) -> dict:
         _build_one_ticket(session, thread_key, emails, known)
         tickets_touched += 1
 
+    # Flush the e.ticket_id reassignments (set inside _build_one_ticket's
+    # per-thread loop above) to the DB BEFORE deleting any orphaned ticket.
+    # Without this, SQLAlchemy's relationship-cascade dependency processor
+    # nulls Email.ticket_id for rows it still sees as members of the deleted
+    # parent's `emails` collection — even ones this very flush just
+    # reassigned elsewhere — silently undoing a merge's email move.
     session.flush()
-    return {"threads": len(threads), "tickets": tickets_touched}
+    purged = _purge_orphaned_tickets(session, live_thread_keys=set(threads))
+    session.flush()
+    return {"threads": len(threads), "tickets": tickets_touched, "purged": purged}
+
+
+def _purge_orphaned_tickets(session: Session, live_thread_keys: set[str]) -> int:
+    """A ticket merge (dashboard/service.py merge_tickets) repoints every one
+    of the duplicate ticket's emails at the survivor's thread_key, leaving the
+    duplicate with zero emails once this rebuild runs. Clean those up here —
+    the single place thread_key -> Ticket cardinality is enforced — rather
+    than each caller having to know how to tear a Ticket down correctly.
+    Dependent rows (events, contributing agents) are deleted; InternalNotes
+    are NOT auto-deleted by callers — merge_tickets migrates them to the
+    survivor first, so none should remain here, but if a ticket was orphaned
+    any other way its notes go too rather than being left dangling."""
+    if not live_thread_keys:
+        return 0
+    orphans = session.query(Ticket).filter(~Ticket.thread_key.in_(live_thread_keys)).all()
+    for t in orphans:
+        session.query(TicketEvent).filter_by(ticket_id=t.id).delete()
+        session.query(TicketAgent).filter_by(ticket_id=t.id).delete()
+        session.query(InternalNote).filter_by(ticket_id=t.id).delete()
+        session.query(TicketTag).filter_by(ticket_id=t.id).delete()
+        session.delete(t)
+    return len(orphans)
 
 
 def _requester(emails: list[Email]) -> tuple[str, str]:
@@ -249,6 +279,16 @@ def _build_one_ticket(session: Session, thread_key: str, emails: list[Email], kn
     )
     ticket.sla_due_at = sla["sla_due_at"]
     ticket.sla_status = sla["sla_status"]
+
+    if is_new:
+        # Automation rules (Zammad-style triggers) fire ONLY at creation —
+        # never on later rebuilds — so a rule can never silently overwrite a
+        # field a human edited afterwards. Flush first: TicketAgent rows
+        # added above (agent_agg loop) aren't visible to automation_engine's
+        # dedup query yet under this autoflush=False session.
+        session.flush()
+        automation_engine.apply_rules_to_new_ticket(session, ticket, emails, known)
+
     return ticket
 
 

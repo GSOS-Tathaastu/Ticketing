@@ -4,6 +4,7 @@ or `streamlit run dashboard/app.py`."""
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sys
 from pathlib import Path
 
@@ -137,15 +138,40 @@ def page_executive(s):
 # --------------------------------------------------------------------------- #
 # Dashboard B — Work Queue
 # --------------------------------------------------------------------------- #
+_WQ_FILTER_KEYS = ["owner", "dept", "status", "inferred", "priority", "ageing", "lastfrom",
+                   "category", "tag", "breached", "unassigned", "escalated", "unknown", "multi", "contrib"]
+
+
+def _wq_clamp(key: str, options: list, default=None):
+    """Guard against a loaded saved view referencing a value (e.g. an owner
+    who no longer exists) that isn't in this run's option list — Streamlit
+    raises if a selectbox's session_state value isn't among its options."""
+    full_key = f"wq_{key}"
+    if st.session_state.get(full_key) not in options:
+        st.session_state[full_key] = default if default is not None else options[0]
+
+
+def _wq_current_filters() -> dict:
+    return {k: st.session_state.get(f"wq_{k}") for k in _WQ_FILTER_KEYS}
+
+
+def _wq_apply_saved_view(filters: dict) -> None:
+    for k, v in filters.items():
+        if k in _WQ_FILTER_KEYS:
+            st.session_state[f"wq_{k}"] = v
+
+
 def page_work_queue(s):
     st.header("B · Work Queue")
     tickets = svc.all_tickets(s)
     omap = svc.owners_map(s)
+    u = UserObj(current_user())
 
     rows = []
     for t in tickets:
         owner = omap.get(t.primary_owner_user_id)
         entity = svc.get_entity(s, t.requesting_entity_id) if t.requesting_entity_id else None
+        tags = svc.tags_for(s, t.id)
         last_from = "—"
         if t.last_customer_email_at and t.last_agent_email_at:
             last_from = "customer" if svc._aware(t.last_customer_email_at) >= svc._aware(t.last_agent_email_at) else "agent"
@@ -163,35 +189,80 @@ def page_work_queue(s):
             "Pending with": t.pending_with or "—", "Priority": t.priority,
             "Ageing (d)": t.ageing_days, "Last email from": last_from,
             "Last email": svc._aware(t.last_email_at).strftime("%Y-%m-%d %H:%M") if t.last_email_at else "—",
-            "SLA": t.sla_status or "—",
+            "SLA": t.sla_status or "—", "Tags": ", ".join(tags) or "—",
             "Action needed": _action_needed(t),
             "_owner_id": t.primary_owner_user_id, "_escalated": t.is_escalated,
             "_unassigned": t.primary_owner_user_id is None,
             "_multi": svc.contributor_count(s, t.id) > 1,
             "_unknown_agent": (not t.last_action_by_agent_id and bool(t.last_agent_email_at)),
-            "_last_from": last_from,
+            "_last_from": last_from, "_tags": tags,
         })
     df = pd.DataFrame(rows)
 
+    # --- Saved views (Zammad "Overviews") --------------------------------
+    views = svc.list_saved_views(s, u)
+    with st.expander("Saved views", expanded=False):
+        vc = st.columns([3, 1])
+        vopts = {f"{v.name}{' · shared' if v.is_shared else ''}": v.id for v in views}
+        if vopts:
+            vpick = vc[0].selectbox("Load a saved view", list(vopts))
+            if vc[1].button("Load"):
+                target = next(v for v in views if v.id == vopts[vpick])
+                _wq_apply_saved_view(json.loads(target.filters_json))
+                st.rerun()
+        else:
+            vc[0].caption("No saved views yet.")
+        st.markdown("**Save current filters as a view**")
+        sc = st.columns([2, 1, 1])
+        new_view_name = sc[0].text_input("Name", key="wq_new_view_name")
+        shared = sc[1].checkbox("Shared with everyone", key="wq_new_view_shared")
+        if sc[2].button("Save view") and new_view_name.strip():
+            name_to_save, filters_to_save = new_view_name.strip(), _wq_current_filters()
+            _mutate(s, lambda ss: svc.create_saved_view(ss, u, name_to_save, filters_to_save, is_shared=shared))
+        mine = [v for v in views if v.owner_user_id == u.id]
+        if mine:
+            dopts = {v.name: v.id for v in mine}
+            dc = st.columns([3, 1])
+            dpick = dc[0].selectbox("Delete a view you own", list(dopts), key="wq_delete_view_pick")
+            if dc[1].button("Delete"):
+                _mutate(s, lambda ss: svc.delete_saved_view(ss, u, dopts[dpick]))
+                s.commit()
+                st.rerun()
+
     with st.expander("Filters", expanded=True):
+        owner_opts = ["(all)", "Unassigned"] + sorted({r["Primary owner"] for r in rows if r["Primary owner"] != "—"})
+        dept_opts = ["(all)"] + sorted({r["Department"] for r in rows})
+        status_opts = ["(all)"] + sorted({r["Manual status"] for r in rows})
+        inferred_opts = ["(all)"] + sorted({r["Inferred status"] for r in rows})
+        priority_opts = ["(all)"] + PRIORITIES
+        ageing_opts = ["(all)"] + sla_engine.AGEING_BUCKETS
+        lastfrom_opts = ["(all)", "customer", "agent"]
+        category_opts = ["(all)"] + sorted({r["Category"] for r in rows})
+        tag_opts = ["(all)"] + svc.all_tags(s)
+        for key, opts in (("owner", owner_opts), ("dept", dept_opts), ("status", status_opts),
+                         ("inferred", inferred_opts), ("priority", priority_opts), ("ageing", ageing_opts),
+                         ("lastfrom", lastfrom_opts), ("category", category_opts), ("tag", tag_opts)):
+            _wq_clamp(key, opts)
+
         c = st.columns(4)
-        f_owner = c[0].selectbox("Owner", ["(all)", "Unassigned"] + sorted(
-            {r["Primary owner"] for r in rows if r["Primary owner"] != "—"}))
-        f_dept = c[1].selectbox("Department", ["(all)"] + sorted({r["Department"] for r in rows}))
-        f_status = c[2].selectbox("Manual status", ["(all)"] + sorted({r["Manual status"] for r in rows}))
-        f_inferred = c[3].selectbox("Inferred status", ["(all)"] + sorted({r["Inferred status"] for r in rows}))
+        f_owner = c[0].selectbox("Owner", owner_opts, key="wq_owner")
+        f_dept = c[1].selectbox("Department", dept_opts, key="wq_dept")
+        f_status = c[2].selectbox("Manual status", status_opts, key="wq_status")
+        f_inferred = c[3].selectbox("Inferred status", inferred_opts, key="wq_inferred")
         c = st.columns(4)
-        f_priority = c[0].selectbox("Priority", ["(all)"] + PRIORITIES)
-        f_ageing = c[1].selectbox("Ageing bucket", ["(all)"] + sla_engine.AGEING_BUCKETS)
-        f_lastfrom = c[2].selectbox("Last email from", ["(all)", "customer", "agent"])
-        f_category = c[3].selectbox("Category", ["(all)"] + sorted({r["Category"] for r in rows}))
-        c = st.columns(6)
-        f_breached = c[0].checkbox("SLA breached")
-        f_unassigned = c[1].checkbox("Unassigned")
-        f_escalated = c[2].checkbox("Escalated")
-        f_unknown = c[3].checkbox("Unknown agent")
-        f_multi = c[4].checkbox("Multiple agents")
-        f_contrib = c[5].text_input("Contributing agent contains")
+        f_priority = c[0].selectbox("Priority", priority_opts, key="wq_priority")
+        f_ageing = c[1].selectbox("Ageing bucket", ageing_opts, key="wq_ageing")
+        f_lastfrom = c[2].selectbox("Last email from", lastfrom_opts, key="wq_lastfrom")
+        f_category = c[3].selectbox("Category", category_opts, key="wq_category")
+        c = st.columns(2)
+        f_tag = c[0].selectbox("Tag", tag_opts, key="wq_tag")
+        f_contrib = c[1].text_input("Contributing agent contains", key="wq_contrib")
+        c = st.columns(5)
+        f_breached = c[0].checkbox("SLA breached", key="wq_breached")
+        f_unassigned = c[1].checkbox("Unassigned", key="wq_unassigned")
+        f_escalated = c[2].checkbox("Escalated", key="wq_escalated")
+        f_unknown = c[3].checkbox("Unknown agent", key="wq_unknown")
+        f_multi = c[4].checkbox("Multiple agents", key="wq_multi")
 
     if not df.empty:
         if f_owner == "Unassigned":
@@ -212,6 +283,8 @@ def page_work_queue(s):
             df = df[df["Ageing (d)"].apply(lambda d: sla_engine.ageing_bucket(d or 0) == f_ageing)]
         if f_lastfrom != "(all)":
             df = df[df["_last_from"] == f_lastfrom]
+        if f_tag != "(all)":
+            df = df[df["_tags"].apply(lambda tl: f_tag in tl)]
         if f_breached:
             df = df[df["SLA"] == sla_engine.BREACHED]
         if f_unassigned:
@@ -233,7 +306,7 @@ def page_work_queue(s):
     display_cols = ["Ticket ID", "Subject", "Requester", "Entity", "Primary owner", "Contrib.",
                     "Last action by", "Department", "Category", "Manual status",
                     "Inferred status", "Pending with", "Priority", "Ageing (d)",
-                    "Last email from", "Last email", "SLA", "Action needed"]
+                    "Last email from", "Last email", "SLA", "Tags", "Action needed"]
     st.dataframe(df[display_cols] if not df.empty else df, use_container_width=True, hide_index=True)
 
     if not df.empty and can("drilldown_tickets"):
@@ -244,6 +317,58 @@ def page_work_queue(s):
             st.session_state["active_ticket"] = options[pick]
             st.session_state["nav"] = "C · Ticket Drill-Down"
             st.rerun()
+
+    if not df.empty:
+        _render_bulk_actions(s, u, df)
+
+
+def _render_bulk_actions(s, u, df):
+    """Macros / bulk actions (Zammad-style): apply one set of field changes to
+    many selected tickets at once, or a saved reusable macro preset."""
+    can_any = any(can(p) for p in ("set_manual_status", "edit_ticket_fields", "assign_owner",
+                                   "manage_tags", "add_note"))
+    if not can_any:
+        return
+    st.divider()
+    with st.expander("Bulk actions / Macros", expanded=False):
+        options = {f"{r['Ticket ID']} — {r['Subject']}": r["PK"] for _, r in df.iterrows()}
+        picked_labels = st.multiselect("Tickets to apply to", list(options))
+        picked_ids = [options[label] for label in picked_labels]
+        if not picked_ids:
+            st.caption("Select one or more tickets above.")
+            return
+
+        macros = svc.list_macros(s)
+        if macros:
+            mopts = {"— none, use fields below —": None} | {m.name: m.id for m in macros}
+            mpick = st.selectbox("Apply a macro", list(mopts))
+            if mopts[mpick] is not None and st.button("Apply macro to selected"):
+                _mutate(s, lambda ss: svc.apply_macro(ss, u, mopts[mpick], picked_ids))
+            st.markdown("— or set fields ad hoc —")
+
+        c = st.columns(4)
+        status = c[0].selectbox("Set manual status", ["(no change)"] + MANUAL_STATUSES[1:],
+                                disabled=not can("set_manual_status"))
+        priority = c[1].selectbox("Set priority", ["(no change)"] + PRIORITIES,
+                                  disabled=not can("edit_ticket_fields"))
+        category = c[2].text_input("Set category", disabled=not can("edit_ticket_fields"))
+        department = c[3].text_input("Set department", disabled=not can("edit_ticket_fields"))
+        c = st.columns(3)
+        owner_opts = {"(no change)": svc.NO_CHANGE, "— unassigned —": None} | {
+            f"{x.name} <{x.email}>": x.id for x in svc.internal_users(s)}
+        owner_pick = c[0].selectbox("Set owner", list(owner_opts), disabled=not can("assign_owner"))
+        add_tag = c[1].text_input("Add tag", disabled=not can("manage_tags"))
+        note = c[2].text_input("Add note", disabled=not can("add_note"))
+
+        if st.button(f"Apply to {len(picked_ids)} selected ticket(s)"):
+            _mutate(s, lambda ss: svc.apply_bulk_actions(
+                ss, u, picked_ids,
+                status=None if status == "(no change)" else status,
+                priority=None if priority == "(no change)" else priority,
+                category=category.strip() or None, department=department.strip() or None,
+                owner_id=owner_opts[owner_pick], add_tag=add_tag.strip() or None,
+                note=note.strip() or None,
+            ))
 
 
 def _action_needed(t) -> str:
@@ -313,6 +438,21 @@ def page_drilldown(s):
         if status_engine.status_mismatch(ticket.inferred_status, ticket.manual_status):
             st.warning(f"⚠️ Status mismatch: inferred **{ticket.inferred_status}** "
                        f"but manual status is **{ticket.manual_status}**.")
+
+    # Tags (Zammad-style free-form labels) --------------------------------
+    with st.expander("🏷️ Tags", expanded=False):
+        tags = svc.tags_for(s, ticket.id)
+        st.markdown(", ".join(f"`{t}`" for t in tags) if tags else "_No tags._")
+        if can("manage_tags"):
+            uo = UserObj(current_user())
+            c = st.columns([2, 1])
+            new_tag = c[0].text_input("Add tag", key="new_tag_input")
+            if c[1].button("Add tag") and new_tag.strip():
+                _mutate(s, lambda ss: svc.tag_ticket(ss, uo, svc.get_ticket(ss, ticket.id), new_tag.strip()))
+            if tags:
+                rm = st.selectbox("Remove a tag", ["(select)"] + tags, key="rm_tag_pick")
+                if rm != "(select)" and st.button("Remove tag"):
+                    _mutate(s, lambda ss: svc.untag_ticket(ss, uo, svc.get_ticket(ss, ticket.id), rm))
 
     # AUA/KUA onboarding extension (DESIGN.md §13) ------------------------
     if ticket.requesting_entity_id:
@@ -417,7 +557,7 @@ def _render_event(s, e):
         st.markdown(f"📝 **Internal note** · {e.from_name} · {_fmt(e.sent_at)}")
         st.info(e.body_text or e.body_snippet or "")
         return
-    if kind in ("status_change", "owner_change", "agent_correction"):
+    if kind in ("status_change", "owner_change", "agent_correction", "merge", "split", "automation"):
         st.markdown(f"🛠️ **{e.subject}** · {e.from_name} · {_fmt(e.sent_at)}  \n{e.body_snippet or ''}")
         return
     header = f"{icon} **{e.direction.upper()}** · {e.from_name or e.from_email} · {_fmt(e.sent_at)}"
@@ -455,6 +595,8 @@ def _edit_panel(s, ticket, omap, events):
     tab_labels = ["Owner & fields", "Status & notes", "Agents"]
     if can("manage_onboarding"):
         tab_labels.append("AUA/KUA Onboarding")
+    if can("merge_split_tickets"):
+        tab_labels.append("Merge / Split")
     tabs = st.tabs(tab_labels)
 
     with tabs[0]:
@@ -527,7 +669,7 @@ def _edit_panel(s, ticket, omap, events):
                         ss, uo, svc.get_event(ss, eid), ce.strip() or None, cn.strip() or None))
 
     if can("manage_onboarding"):
-        with tabs[3]:
+        with tabs[tab_labels.index("AUA/KUA Onboarding")]:
             entities = svc.list_entities(s)
             eopts = {"— not linked —": None} | {f"{x.name} (id={x.id})": x.id for x in entities}
             ecur = next((k for k, v in eopts.items() if v == ticket.requesting_entity_id), "— not linked —")
@@ -556,6 +698,32 @@ def _edit_panel(s, ticket, omap, events):
                 if st.button("Save related attempt"):
                     _mutate(s, lambda ss: svc.link_previous_attempt(
                         ss, uo, svc.get_ticket(ss, ticket.id), popts[psel]))
+
+    if can("merge_split_tickets"):
+        with tabs[tab_labels.index("Merge / Split")]:
+            st.markdown("**Merge another ticket into this one** — its emails and internal notes "
+                       "move here; the other ticket is closed and disappears from the Work Queue.")
+            other_tickets = [t for t in svc.all_tickets(s) if t.id != ticket.id]
+            mopts = {f"{t.ticket_id} — {(t.subject or '')[:50]}": t.id for t in other_tickets}
+            if mopts:
+                mpick = st.selectbox("Ticket to merge in", list(mopts))
+                if st.button("Merge into this ticket"):
+                    _mutate(s, lambda ss: svc.merge_tickets(
+                        ss, uo, svc.get_ticket(ss, ticket.id), svc.get_ticket(ss, mopts[mpick])))
+            else:
+                st.caption("No other tickets to merge.")
+
+            st.divider()
+            st.markdown("**Split off part of this ticket into a new one** — pick the emails that "
+                       "actually belong to a separate issue.")
+            eopts = {f"{_fmt(e.sent_at)} — {(e.subject or '')[:50]} ({e.direction})": e.email_id
+                    for e in events if e.event_kind == "email" and e.email_id}
+            picked = st.multiselect("Emails to move to a new ticket", list(eopts))
+            new_subj = st.text_input("New ticket subject (optional)")
+            if picked and st.button("Split off into new ticket"):
+                _mutate(s, lambda ss: svc.split_ticket(
+                    ss, uo, svc.get_ticket(ss, ticket.id),
+                    [eopts[p] for p in picked], new_subj.strip() or None))
 
 
 def _mutate(_s, fn):
@@ -754,7 +922,7 @@ def page_admin(s):
     st.header("Admin")
     from db.models import SlaRule, User
 
-    tabs = st.tabs(["Users", "SLA rules", "Entities", "Settings"])
+    tabs = st.tabs(["Users", "SLA rules", "Entities", "Settings", "Automation rules", "Macros"])
     with tabs[0]:
         st.subheader("Users")
         users = s.query(User).all()
@@ -952,6 +1120,125 @@ def page_admin(s):
 
         if not editable:
             st.caption("Read-only for your role.")
+
+    with tabs[4]:
+        st.subheader("Automation rules (triggers)")
+        st.caption("Evaluated once, only when a NEW ticket is created — never on later rebuilds, "
+                  "so a rule can never silently overwrite a field a human edited afterwards.")
+        rules = svc.list_automation_rules(s)
+        if rules:
+            st.dataframe(pd.DataFrame([{
+                "ID": r.id, "Name": r.name, "Active": r.is_active, "Order": r.run_order,
+                "If": f'{r.condition_field} {r.condition_op} "{r.condition_value}"',
+                "Set category": r.action_set_category or "—", "Set priority": r.action_set_priority or "—",
+                "Set dept": r.action_set_department or "—", "Assign owner": r.action_assign_owner_email or "—",
+                "Add tag": r.action_add_tag or "—",
+            } for r in rules]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No automation rules yet.")
+
+        if can("configure_automation"):
+            with st.form("new_automation_rule"):
+                st.markdown("**Add a rule**")
+                c = st.columns(4)
+                name = c[0].text_input("Name")
+                active = c[1].checkbox("Active", value=True)
+                order = c[2].number_input("Run order", value=0, step=1)
+                cond_field = c[3].selectbox("Condition field",
+                                            ["subject", "body", "requester_email", "requester_domain"])
+                c = st.columns(2)
+                cond_op = c[0].selectbox("Condition", ["contains", "equals"])
+                cond_val = c[1].text_input("Condition value")
+                st.markdown("_Actions — leave blank to skip_")
+                c = st.columns(3)
+                act_cat = c[0].text_input("Set category")
+                act_prio = c[1].selectbox("Set priority", [""] + PRIORITIES)
+                act_dept = c[2].text_input("Set department")
+                c = st.columns(2)
+                act_owner = c[0].text_input("Assign owner (email)")
+                act_tag = c[1].text_input("Add tag")
+                if st.form_submit_button("Create rule") and name and cond_val:
+                    ss = get_session()
+                    try:
+                        svc.create_automation_rule(
+                            ss, UserObj(current_user()), name=name, is_active=active, run_order=int(order),
+                            condition_field=cond_field, condition_op=cond_op, condition_value=cond_val,
+                            action_set_category=act_cat or None, action_set_priority=act_prio or None,
+                            action_set_department=act_dept or None, action_assign_owner_email=act_owner or None,
+                            action_add_tag=act_tag or None)
+                        ss.commit()
+                        st.success(f"Created rule '{name}'")
+                    except Exception as exc:  # noqa: BLE001
+                        ss.rollback()
+                        st.error(str(exc))
+                    finally:
+                        ss.close()
+                    st.rerun()
+
+            if rules:
+                st.markdown("**Toggle / delete a rule**")
+                ropts = {f"{r.name} (id={r.id})": r.id for r in rules}
+                rpick = st.selectbox("Rule", list(ropts), key="automation_rule_pick")
+                cur_rule = next(r for r in rules if r.id == ropts[rpick])
+                c = st.columns(2)
+                if c[0].button("Toggle active"):
+                    _mutate(s, lambda ss: svc.update_automation_rule(
+                        ss, UserObj(current_user()), ropts[rpick], is_active=not cur_rule.is_active))
+                if c[1].button("Delete rule"):
+                    _mutate(s, lambda ss: svc.delete_automation_rule(ss, UserObj(current_user()), ropts[rpick]))
+
+    with tabs[5]:
+        st.subheader("Macros")
+        st.caption("A reusable, named bundle of field changes agents can apply to one or more "
+                  "tickets at once from the Work Queue's Bulk actions panel.")
+        macros = svc.list_macros(s)
+        if macros:
+            st.dataframe(pd.DataFrame([{
+                "ID": m.id, "Name": m.name, "Status": m.action_set_status or "—",
+                "Priority": m.action_set_priority or "—", "Category": m.action_set_category or "—",
+                "Department": m.action_set_department or "—", "Owner": m.action_assign_owner_email or "—",
+                "Tag": m.action_add_tag or "—", "Note": (m.action_add_note or "—")[:40],
+            } for m in macros]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No macros yet.")
+
+        if can("configure_macros"):
+            with st.form("new_macro"):
+                st.markdown("**Add a macro** _(leave a field blank to leave it unchanged when applied)_")
+                name = st.text_input("Name")
+                c = st.columns(4)
+                status = c[0].selectbox("Set status", [""] + MANUAL_STATUSES[1:])
+                priority = c[1].selectbox("Set priority", [""] + PRIORITIES)
+                category = c[2].text_input("Set category")
+                department = c[3].text_input("Set department")
+                c = st.columns(2)
+                owner_email = c[0].text_input("Assign owner (email)")
+                tag = c[1].text_input("Add tag")
+                note = st.text_area("Add note")
+                if st.form_submit_button("Create macro") and name:
+                    ss = get_session()
+                    try:
+                        svc.create_macro(
+                            ss, UserObj(current_user()), name=name,
+                            action_set_status=status or None, action_set_priority=priority or None,
+                            action_set_category=category or None, action_set_department=department or None,
+                            action_assign_owner_email=owner_email or None, action_add_tag=tag or None,
+                            action_add_note=note or None)
+                        ss.commit()
+                        st.success(f"Created macro '{name}'")
+                    except Exception as exc:  # noqa: BLE001
+                        ss.rollback()
+                        st.error(str(exc))
+                    finally:
+                        ss.close()
+                    st.rerun()
+
+            if macros:
+                st.markdown("**Delete a macro**")
+                mopts = {f"{m.name} (id={m.id})": m.id for m in macros}
+                mpick = st.selectbox("Macro", list(mopts), key="macro_delete_pick")
+                if st.button("Delete macro"):
+                    _mutate(s, lambda ss: svc.delete_macro(ss, UserObj(current_user()), mopts[mpick]))
 
 
 # --------------------------------------------------------------------------- #

@@ -9,6 +9,18 @@ Nothing here should be started without an explicit go-ahead.
 
 ---
 
+## Done — Zammad-inspired features
+
+Evaluated Zammad (self-hosted open-source helpdesk) as a possible
+alternative, then built the parts that fit this project's constraints
+(local, audit-logged, no reply-sending from the dashboard) directly in:
+**tags**, **saved Work Queue views**, **automation rules** (fire once, at
+ticket creation only), **macros / bulk actions**, and **ticket merge &
+split**. See README "Zammad-inspired features" for details and known
+limitations.
+
+---
+
 ## Near-term (contained scope, clear day-to-day value)
 
 - **Full-text search** over ticket/email content. There's currently no way
@@ -21,11 +33,10 @@ Nothing here should be started without an explicit go-ahead.
   summary to a supervisor's inbox) doesn't conflict with the "no
   customer-facing sending" rule, since it's an ops notification, not a
   reply.
-- **Bulk actions on the Work Queue.** Every mutation today is one ticket at
-  a time via the drill-down (`dashboard/service.py`'s mutation functions all
-  take a single `Ticket`). Multi-select assign-owner / set-status / set
-  category from the queue table would matter once a supervisor is managing
-  dozens of tickets at once.
+- ~~**Bulk actions on the Work Queue.**~~ **Done.** Work Queue → **Bulk
+  actions / Macros** — multi-select tickets, apply a set of field changes at
+  once (ad hoc, or via a saved macro preset under Admin → Macros). See
+  README "Zammad-inspired features".
 - ~~**Editable SLA rules UI.**~~ **Done.** `Admin → SLA rules` is now
   editable (edit existing + add category-specific rules), admin-only
   (`configure_sla`), audit-logged. Delivered alongside the broader
@@ -53,9 +64,9 @@ Nothing here should be started without an explicit go-ahead.
   above.
 - **Per-team/department routing rules** — auto-assign a primary owner by
   category/department instead of leaving every new ticket unassigned.
-- **Saved/bookmarked Work Queue filter presets** — supervisors likely have
-  recurring filter combinations (e.g. "my team's SLA breaches") worth
-  saving rather than re-selecting each time.
+- ~~**Saved/bookmarked Work Queue filter presets.**~~ **Done.** Work Queue →
+  **Saved views** — personal or shared with everyone. See README
+  "Zammad-inspired features".
 - **mbox/PST importers** — mbox is a small addition (stdlib `mailbox`
   module, same shape as the existing `.eml` importer); PST remains a
   documented placeholder needing external conversion (`readpst`).

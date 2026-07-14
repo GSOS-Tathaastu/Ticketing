@@ -120,6 +120,13 @@ class Email(Base):
 
     requesting_entity_id = Column(Integer, ForeignKey("requesting_entities.id"), index=True)
 
+    # Manual ticket merge/split (Zammad-style): when set, this value wins over
+    # whatever thread_mapper.recompute_thread_keys() would otherwise compute,
+    # on every rebuild, forever — same "manual always wins" rule used for
+    # requester/status/onboarding-stage overrides elsewhere. See
+    # tickets/thread_mapper.py and dashboard/service.py merge_tickets/split_ticket.
+    manual_thread_key = Column(String(255), index=True)
+
 
 # --------------------------------------------------------------------------- #
 # Ticket
@@ -259,6 +266,88 @@ class InternalNote(Base):
     created_at = Column(DateTime, default=_utcnow)
 
     ticket = relationship("Ticket", back_populates="notes")
+
+
+# --------------------------------------------------------------------------- #
+# Tags — free-form labels on tickets, independent of the fixed category field
+# (Zammad-style tagging). See dashboard/service.py add_tag/remove_tag.
+# --------------------------------------------------------------------------- #
+class TicketTag(Base):
+    __tablename__ = "ticket_tags"
+    __table_args__ = (UniqueConstraint("ticket_id", "tag", name="uq_ticket_tag"),)
+
+    id = Column(Integer, primary_key=True)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), index=True)
+    tag = Column(String(64), index=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=_utcnow)
+
+
+# --------------------------------------------------------------------------- #
+# Saved Work Queue filter presets (Zammad "Overviews"). Personal by default;
+# is_shared makes it visible to every user, not just the owner.
+# --------------------------------------------------------------------------- #
+class SavedView(Base):
+    __tablename__ = "saved_views"
+
+    id = Column(Integer, primary_key=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    name = Column(String(128), nullable=False)
+    filters_json = Column(Text, nullable=False)
+    is_shared = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+# --------------------------------------------------------------------------- #
+# Automation rules (Zammad "Triggers"). Single condition -> one or more
+# actions, evaluated once per ticket at CREATION time only (see
+# tickets/automation_engine.py) — never on later rebuilds, so a rule can never
+# silently clobber a field a human edited afterwards.
+# --------------------------------------------------------------------------- #
+class AutomationRule(Base):
+    __tablename__ = "automation_rules"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(128), nullable=False)
+    is_active = Column(Boolean, default=True)
+    run_order = Column(Integer, default=0)
+
+    condition_field = Column(String(24), default="subject")   # subject|body|requester_domain|requester_email
+    condition_op = Column(String(16), default="contains")     # contains|equals
+    condition_value = Column(String(255))
+
+    action_set_category = Column(String(128))
+    action_set_priority = Column(String(16))
+    action_set_department = Column(String(128))
+    action_assign_owner_email = Column(String(320))
+    action_add_tag = Column(String(64))
+
+    created_by_user_id = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+# --------------------------------------------------------------------------- #
+# Macros (Zammad-style) — a named, reusable bundle of field changes an agent
+# can apply to one or more tickets at once. See dashboard/service.py
+# apply_macro / apply_bulk_actions.
+# --------------------------------------------------------------------------- #
+class Macro(Base):
+    __tablename__ = "macros"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(128), nullable=False, unique=True)
+
+    action_set_status = Column(String(32))
+    action_set_priority = Column(String(16))
+    action_set_category = Column(String(128))
+    action_set_department = Column(String(128))
+    action_assign_owner_email = Column(String(320))
+    action_add_tag = Column(String(64))
+    action_add_note = Column(Text)
+
+    created_by_user_id = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=_utcnow)
 
 
 # --------------------------------------------------------------------------- #

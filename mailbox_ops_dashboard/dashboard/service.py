@@ -5,25 +5,30 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import hashlib
 import io
 import json
 import zipfile
 
 from sqlalchemy.orm import Session
 
-from auth.users import require, write_audit
+from auth.users import PermissionError_, require, write_audit
 from config.runtime_settings import NEVER_OVERRIDABLE, OVERRIDABLE, apply_db_overrides, effective_settings_dict
 from db.models import (
     AppSetting,
     AuditLog,
+    AutomationRule,
     Email,
     InternalNote,
+    Macro,
     RequestingEntity,
+    SavedView,
     SlaRule,
     SyncRun,
     Ticket,
     TicketAgent,
     TicketEvent,
+    TicketTag,
     User,
 )
 from tickets import sla_engine, stage_detection_engine, status_engine
@@ -82,6 +87,71 @@ def ticket_notes(session: Session, ticket_id: int) -> list[InternalNote]:
 
 def internal_users(session: Session) -> list[User]:
     return session.query(User).filter(User.internal.is_(True)).order_by(User.name).all()
+
+
+# --------------------------------------------------------------------------- #
+# Tags — free-form labels on tickets (Zammad-style), separate from the fixed
+# category field. See db/models.py TicketTag.
+# --------------------------------------------------------------------------- #
+def tags_for(session: Session, ticket_id: int) -> list[str]:
+    return [t.tag for t in session.query(TicketTag).filter_by(ticket_id=ticket_id)
+           .order_by(TicketTag.tag).all()]
+
+
+def all_tags(session: Session) -> list[str]:
+    return sorted({row[0] for row in session.query(TicketTag.tag).distinct().all()})
+
+
+def tag_ticket(session: Session, user: User, ticket: Ticket, tag: str) -> None:
+    require(user, "manage_tags")
+    tag = tag.strip().lower()
+    if not tag or session.query(TicketTag).filter_by(ticket_id=ticket.id, tag=tag).first():
+        return
+    session.add(TicketTag(ticket_id=ticket.id, tag=tag, created_by_user_id=user.id))
+    write_audit(session, user=user, action_type="tag_ticket", entity_type="ticket",
+                entity_id=ticket.ticket_id, new_value=tag)
+
+
+def untag_ticket(session: Session, user: User, ticket: Ticket, tag: str) -> None:
+    require(user, "manage_tags")
+    tag = tag.strip().lower()
+    row = session.query(TicketTag).filter_by(ticket_id=ticket.id, tag=tag).first()
+    if row:
+        session.delete(row)
+        write_audit(session, user=user, action_type="untag_ticket", entity_type="ticket",
+                    entity_id=ticket.ticket_id, old_value=tag)
+
+
+# --------------------------------------------------------------------------- #
+# Saved Work Queue filter presets (Zammad "Overviews"). Personal by default;
+# is_shared makes a view visible to every user, not just its owner.
+# --------------------------------------------------------------------------- #
+def list_saved_views(session: Session, user: User) -> list[SavedView]:
+    return session.query(SavedView).filter(
+        (SavedView.owner_user_id == user.id) | (SavedView.is_shared.is_(True))
+    ).order_by(SavedView.name).all()
+
+
+def create_saved_view(session: Session, user: User, name: str, filters: dict, is_shared: bool = False) -> SavedView:
+    require(user, "view_tickets")
+    view = SavedView(owner_user_id=user.id, name=name.strip(), filters_json=json.dumps(filters),
+                     is_shared=is_shared)
+    session.add(view)
+    session.flush()
+    write_audit(session, user=user, action_type="create_saved_view", entity_type="saved_view",
+                entity_id=view.id, new_value={"name": name, "shared": is_shared})
+    return view
+
+
+def delete_saved_view(session: Session, user: User, view_id: int) -> None:
+    view = session.get(SavedView, view_id)
+    if view is None:
+        return
+    if view.owner_user_id != user.id:
+        raise PermissionError_(f"Only the owner may delete saved view {view_id}")
+    session.delete(view)
+    write_audit(session, user=user, action_type="delete_saved_view", entity_type="saved_view",
+                entity_id=view_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -510,6 +580,219 @@ def audit_logs(session: Session, limit: int = 200) -> list[AuditLog]:
 def recalc(session: Session, user: User) -> dict:
     require(user, "configure_ingestion")
     return rebuild_tickets(session)
+
+
+# --------------------------------------------------------------------------- #
+# Automation rules (Zammad "Triggers"). Evaluation lives in
+# tickets/automation_engine.py, fired only at ticket-creation time by
+# ticket_builder.rebuild_tickets — this section is CRUD only.
+# --------------------------------------------------------------------------- #
+def list_automation_rules(session: Session) -> list[AutomationRule]:
+    return session.query(AutomationRule).order_by(AutomationRule.run_order, AutomationRule.id).all()
+
+
+def create_automation_rule(session: Session, user: User, **fields) -> AutomationRule:
+    require(user, "configure_automation")
+    rule = AutomationRule(created_by_user_id=user.id, **fields)
+    session.add(rule)
+    session.flush()
+    write_audit(session, user=user, action_type="create_automation_rule", entity_type="automation_rule",
+                entity_id=rule.id, new_value=fields)
+    return rule
+
+
+def update_automation_rule(session: Session, user: User, rule_id: int, **fields) -> None:
+    require(user, "configure_automation")
+    rule = session.get(AutomationRule, rule_id)
+    if rule is None:
+        raise ValueError(f"Automation rule {rule_id} not found")
+    old = {k: getattr(rule, k) for k in fields}
+    for k, v in fields.items():
+        setattr(rule, k, v)
+    write_audit(session, user=user, action_type="update_automation_rule", entity_type="automation_rule",
+                entity_id=rule_id, old_value=old, new_value=fields)
+
+
+def delete_automation_rule(session: Session, user: User, rule_id: int) -> None:
+    require(user, "configure_automation")
+    rule = session.get(AutomationRule, rule_id)
+    if rule is None:
+        return
+    session.delete(rule)
+    write_audit(session, user=user, action_type="delete_automation_rule", entity_type="automation_rule",
+                entity_id=rule_id)
+
+
+# --------------------------------------------------------------------------- #
+# Macros — named, reusable field-change bundles an agent applies to one or
+# more tickets at once (Zammad-style). Preset management is admin/manager-
+# only (configure_macros); APPLYING one only needs the permission(s) for
+# whichever fields it actually touches, checked in apply_bulk_actions below.
+# --------------------------------------------------------------------------- #
+def list_macros(session: Session) -> list[Macro]:
+    return session.query(Macro).order_by(Macro.name).all()
+
+
+def create_macro(session: Session, user: User, **fields) -> Macro:
+    require(user, "configure_macros")
+    macro = Macro(created_by_user_id=user.id, **fields)
+    session.add(macro)
+    session.flush()
+    write_audit(session, user=user, action_type="create_macro", entity_type="macro",
+                entity_id=macro.id, new_value=fields)
+    return macro
+
+
+def update_macro(session: Session, user: User, macro_id: int, **fields) -> None:
+    require(user, "configure_macros")
+    macro = session.get(Macro, macro_id)
+    if macro is None:
+        raise ValueError(f"Macro {macro_id} not found")
+    old = {k: getattr(macro, k) for k in fields}
+    for k, v in fields.items():
+        setattr(macro, k, v)
+    write_audit(session, user=user, action_type="update_macro", entity_type="macro",
+                entity_id=macro_id, old_value=old, new_value=fields)
+
+
+def delete_macro(session: Session, user: User, macro_id: int) -> None:
+    require(user, "configure_macros")
+    macro = session.get(Macro, macro_id)
+    if macro is None:
+        return
+    session.delete(macro)
+    write_audit(session, user=user, action_type="delete_macro", entity_type="macro", entity_id=macro_id)
+
+
+# --------------------------------------------------------------------------- #
+# Bulk actions — apply the same set of field changes to many tickets at once.
+# Every permission for a field actually being changed is checked ONCE up
+# front (fail fast, nothing partially applied on a permission error), then
+# each ticket goes through the exact same audited mutation functions the
+# single-ticket edit panel uses — no separate un-audited code path.
+# --------------------------------------------------------------------------- #
+NO_CHANGE = object()  # sentinel: distinguishes "leave owner alone" from "unassign" (None)
+
+
+def apply_bulk_actions(session: Session, user: User, ticket_ids: list[int], *,
+                       status: str | None = None, closure_note: str | None = None,
+                       priority: str | None = None, category: str | None = None,
+                       department: str | None = None, owner_id=NO_CHANGE,
+                       add_tag: str | None = None, note: str | None = None) -> int:
+    if status is not None:
+        require(user, "set_manual_status")
+    field_changes = {k: v for k, v in {"department": department, "category": category,
+                                       "priority": priority}.items() if v is not None}
+    if field_changes:
+        require(user, "edit_ticket_fields")
+    if owner_id is not NO_CHANGE:
+        require(user, "assign_owner")
+    if add_tag:
+        require(user, "manage_tags")
+    if note:
+        require(user, "add_note")
+
+    touched = 0
+    for tid in ticket_ids:
+        ticket = session.get(Ticket, tid)
+        if ticket is None:
+            continue
+        if status is not None:
+            set_manual_status(session, user, ticket, status, closure_note)
+        if field_changes:
+            set_ticket_fields(session, user, ticket, **field_changes)
+        if owner_id is not NO_CHANGE:
+            assign_owner(session, user, ticket, owner_id)
+        if add_tag:
+            tag_ticket(session, user, ticket, add_tag)
+        if note:
+            add_note(session, user, ticket, note)
+        touched += 1
+    return touched
+
+
+def apply_macro(session: Session, user: User, macro_id: int, ticket_ids: list[int]) -> int:
+    macro = session.get(Macro, macro_id)
+    if macro is None:
+        raise ValueError(f"Macro {macro_id} not found")
+    owner_id = NO_CHANGE
+    if macro.action_assign_owner_email:
+        owner = session.query(User).filter_by(email=macro.action_assign_owner_email.strip().lower()).first()
+        if owner:
+            owner_id = owner.id
+    return apply_bulk_actions(
+        session, user, ticket_ids,
+        status=macro.action_set_status, priority=macro.action_set_priority,
+        category=macro.action_set_category, department=macro.action_set_department,
+        owner_id=owner_id, add_tag=macro.action_add_tag, note=macro.action_add_note,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Ticket merge & split (Zammad-style). Both work by repointing
+# Email.manual_thread_key and letting tickets/ticket_builder.rebuild_tickets
+# do the actual reconstruction — that's the one place thread_key -> Ticket
+# grouping is computed, so merge/split never duplicate that logic. See
+# tickets/thread_mapper.py for why the override survives every future
+# rebuild, and ticket_builder._purge_orphaned_tickets for cleanup.
+# --------------------------------------------------------------------------- #
+def merge_tickets(session: Session, user: User, survivor: Ticket, duplicate: Ticket) -> dict:
+    require(user, "merge_split_tickets")
+    if survivor.id == duplicate.id:
+        raise ValueError("Cannot merge a ticket into itself")
+
+    # Preserve human-authored state the rebuild can't regenerate on its own.
+    session.query(InternalNote).filter_by(ticket_id=duplicate.id).update({"ticket_id": survivor.id})
+    for row in session.query(TicketTag).filter_by(ticket_id=duplicate.id).all():
+        if session.query(TicketTag).filter_by(ticket_id=survivor.id, tag=row.tag).first():
+            session.delete(row)
+        else:
+            row.ticket_id = survivor.id
+    if survivor.primary_owner_user_id is None and duplicate.primary_owner_user_id is not None:
+        survivor.primary_owner_user_id = duplicate.primary_owner_user_id
+
+    moved = session.query(Email).filter_by(thread_key=duplicate.thread_key).all()
+    for e in moved:
+        e.manual_thread_key = survivor.thread_key
+
+    session.add(TicketEvent(ticket_id=survivor.id, event_kind="merge", from_name=user.email,
+                            subject=f"Merged {duplicate.ticket_id} into this ticket",
+                            body_snippet=f"{len(moved)} email(s) moved from {duplicate.ticket_id}",
+                            sent_at=_now()))
+    write_audit(session, user=user, action_type="merge_tickets", entity_type="ticket",
+                entity_id=survivor.ticket_id, old_value=duplicate.ticket_id, new_value=survivor.ticket_id)
+
+    stats = rebuild_tickets(session)  # repoints emails, regenerates events/agents, purges the now-empty duplicate
+    return {"survivor_ticket_id": survivor.ticket_id, "emails_moved": len(moved), **stats}
+
+
+def split_ticket(session: Session, user: User, ticket: Ticket, email_ids: list[int],
+                 new_subject: str | None = None) -> Ticket:
+    require(user, "merge_split_tickets")
+    emails = session.query(Email).filter(Email.id.in_(email_ids), Email.ticket_id == ticket.id).all()
+    if not emails:
+        raise ValueError("No matching emails on this ticket to split off")
+    total = session.query(Email).filter_by(ticket_id=ticket.id).count()
+    if len(emails) >= total:
+        raise ValueError("Cannot split off every email on the ticket — it would leave the original empty")
+
+    new_key = "th_split_" + hashlib.sha1(
+        f"{ticket.thread_key}:{sorted(email_ids)}:{_now().isoformat()}".encode()).hexdigest()[:20]
+    for e in emails:
+        e.manual_thread_key = new_key
+
+    session.add(TicketEvent(ticket_id=ticket.id, event_kind="split", from_name=user.email,
+                            subject="Split off into a new ticket",
+                            body_snippet=f"{len(emails)} email(s) moved to a new ticket",
+                            sent_at=_now()))
+    write_audit(session, user=user, action_type="split_ticket", entity_type="ticket",
+                entity_id=ticket.ticket_id, new_value={"emails_moved": len(emails), "new_thread_key": new_key})
+
+    rebuild_tickets(session)  # creates the new ticket via the normal thread-grouping path
+    new_ticket = session.query(Ticket).filter_by(thread_key=new_key).first()
+    if new_ticket and new_subject:
+        new_ticket.subject = new_subject.strip()
+    return new_ticket
 
 
 # --------------------------------------------------------------------------- #

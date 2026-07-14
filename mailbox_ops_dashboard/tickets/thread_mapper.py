@@ -131,7 +131,22 @@ def recompute_thread_keys(session: Session) -> int:
             updated += 1
 
     updated += _apply_onboarding_entity_folding(session, emails)
+    updated += _apply_manual_thread_overrides(emails)
     session.flush()
+    return updated
+
+
+def _apply_manual_thread_overrides(emails: list[Email]) -> int:
+    """Ticket merge/split (dashboard/service.py) pins specific emails to a
+    manually chosen thread_key via Email.manual_thread_key. That pin must win
+    over EVERYTHING above — the message-id graph, subject fallback, and
+    onboarding folding — on every single rebuild, forever, or the merge/split
+    would silently undo itself the next time tickets are recalculated."""
+    updated = 0
+    for e in emails:
+        if e.manual_thread_key and e.thread_key != e.manual_thread_key:
+            e.thread_key = e.manual_thread_key
+            updated += 1
     return updated
 
 

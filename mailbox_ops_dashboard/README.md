@@ -157,8 +157,22 @@ PostgreSQL. Core tables:
   object. `tickets`/`emails` gain `requesting_entity_id`;
   `tickets` also gain `inferred_onboarding_stage` / `manual_onboarding_stage`
   / `related_previous_ticket_id`; `ticket_events` gains `document_type`.
+- **ticket_tags** — free-form tags on a ticket (see "Zammad-inspired
+  features" below)
+- **saved_views** — a user's saved Work Queue filter combination, personal or
+  shared
+- **automation_rules** — condition → action(s), evaluated once at ticket
+  creation
+- **macros** — a named, reusable bundle of field changes for bulk actions
+- `emails` also gains `manual_thread_key` — a manual, permanent override of
+  the normal thread-reconstruction, used by ticket merge/split
 
-Full column lists are in [`db/models.py`](db/models.py).
+Full column lists are in [`db/models.py`](db/models.py). **Note:** the MVP
+uses `create_all` with no Alembic (see `db/migrations_or_init.py`) — an
+existing SQLite file from before these tables were added will pick them up
+fine on the next `init-db`/app start (missing tables get created), but if you
+want a fully clean slate, delete `data/mailbox_ops.db` and re-run
+`init-db`/`seed-demo`.
 
 ---
 
@@ -214,6 +228,48 @@ drill-down uses `st.expander` sections for the expand/collapse requirement.)*
 
 ---
 
+## Zammad-inspired features
+
+Four capabilities borrowed from Zammad (evaluated as an open-source
+alternative, then built directly into this dashboard instead) — scoped to
+what fits a local, no-external-send, audit-logged internal mailbox tool:
+
+- **Tags** — free-form labels on a ticket (`🏷️ Tags` in the drill-down;
+  filterable from the Work Queue), independent of the fixed `category` field.
+  Requires `manage_tags` (Admin, Manager, Analyst).
+- **Saved views** (Zammad "Overviews") — save the Work Queue's current filter
+  combination under a name, personal or shared with everyone. Work Queue →
+  **Saved views**.
+- **Automation rules** (Zammad "Triggers") — Admin → **Automation rules**: a
+  condition (subject/body/requester email/requester domain contains or
+  equals a value) plus one or more actions (set category/priority/department,
+  assign an owner, add a tag). **Fires exactly once, only when a ticket is
+  first created** — never on a later `recalculate-tickets` — so a rule can
+  never silently overwrite a field a human edited afterwards. Requires
+  `configure_automation` (Admin only) to manage rules.
+- **Macros & bulk actions** — Work Queue → **Bulk actions / Macros**: select
+  multiple tickets and apply a set of field changes at once, either ad hoc or
+  via a saved, reusable **macro** preset (Admin → **Macros**, requires
+  `configure_macros`). Applying a macro only needs the permission for
+  whichever fields it actually touches — the same audited mutation functions
+  the single-ticket edit panel uses, just looped.
+- **Ticket merge & split** — drill-down → **Merge / Split** tab (requires
+  `merge_split_tickets`, Admin/Manager). Merge combines two tickets that
+  turned out to be the same issue (the duplicate's emails, internal notes,
+  and — if the survivor has none — owner all move to the survivor; the
+  duplicate ticket then disappears). Split peels selected emails off into a
+  brand-new ticket when a thread actually covers two unrelated issues. Both
+  work by pinning the moved emails to a specific ticket via
+  `Email.manual_thread_key`, which permanently overrides the normal
+  message-id/subject thread-reconstruction on every future rebuild — see
+  `tickets/thread_mapper.py`. **Known limitation:** a genuinely new reply
+  that references a pre-merge message via `In-Reply-To` will follow its
+  original auto-computed thread, not necessarily the merged destination —
+  acceptable for the same reason as the other best-effort detection
+  cascades in this project (manual correction is always available).
+
+---
+
 ## Role-based access
 
 Enforced in the **backend service layer** (`auth/users.require`), not only the
@@ -221,10 +277,10 @@ UI, so an under-privileged user cannot mutate via any code path.
 
 | Role | Capabilities |
 |------|--------------|
-| **Admin** | Everything: ingestion/mailbox/domain/SLA config, user management, all dashboards & edits |
-| **Manager / Supervisor** | All dashboards & tickets, assign/reassign owners, correct detected agent, edit priority/category/status, notes, view audit |
+| **Admin** | Everything: ingestion/mailbox/domain/SLA config, user management, all dashboards & edits, automation rules, macro presets |
+| **Manager / Supervisor** | All dashboards & tickets, assign/reassign owners, correct detected agent, edit priority/category/status, notes, tags, merge/split tickets, view audit |
 | **Senior Viewer / Leadership** | Read-only dashboards + drill-down, no edits |
-| **Analyst** | View team/assigned tickets, update permitted status, add notes |
+| **Analyst** | View team/assigned tickets, update permitted status, add notes, tags |
 | **Auditor** | Read-only ticket history + audit logs |
 
 Only **Admin** holds `configure_mailbox` / `configure_internal_domains` /

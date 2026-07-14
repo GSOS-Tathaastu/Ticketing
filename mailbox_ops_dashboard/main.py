@@ -5,6 +5,7 @@ Commands:
   python main.py ingest-eml --path ./data/eml_exports
   python main.py ingest-manual --file msg.eml
   python main.py sync-gmail [--query "newer_than:30d"]
+  python main.py test-imap                    # diagnose NIC/IMAP connectivity, run first
   python main.py sync-imap [--since 2024-01-01]
   python main.py run-dashboard [--port 8501]
   python main.py create-user --email X --name N --role R [--password P]
@@ -91,6 +92,23 @@ def cmd_sync_imap(args) -> None:
     with session_scope() as s:
         stats = ingest(s, conn)
     _print_stats("IMAP (NIC/intranet)", stats)
+
+
+def cmd_test_imap(args) -> None:
+    """Run BEFORE sync-imap on a machine with real UIDAI VPN/intranet access.
+    Diagnoses reachability/auth step by step without ingesting anything —
+    never prints email content or the configured password."""
+    from connectors.imap_diagnostics import run_diagnostics
+
+    print("Testing IMAP connectivity (config -> DNS -> TCP -> TLS -> LOGIN -> mailbox)...\n")
+    steps = run_diagnostics()
+    for step in steps:
+        mark = "✓" if step.ok else "✗"
+        print(f"{mark} {step.name}: {step.detail}")
+    if steps and steps[-1].ok and all(s.ok for s in steps):
+        print("\nAll checks passed. Safe to run: python main.py sync-imap")
+    else:
+        print("\nStopped at the first failing step above — fix that before proceeding.")
 
 
 def cmd_run_dashboard(args) -> None:
@@ -202,6 +220,9 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("sync-imap", help="Sync from IMAP (NIC/intranet, needs VPN)")
     q.add_argument("--since", help="YYYY-MM-DD")
     q.set_defaults(func=cmd_sync_imap)
+
+    q = sub.add_parser("test-imap", help="Diagnose NIC/IMAP connectivity step by step (run before sync-imap)")
+    q.set_defaults(func=cmd_test_imap)
 
     q = sub.add_parser("run-dashboard", help="Launch the Streamlit dashboard")
     q.add_argument("--port", type=int, default=8501)

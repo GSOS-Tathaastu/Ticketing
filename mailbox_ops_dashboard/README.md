@@ -62,6 +62,7 @@ python main.py init-db [--admin-email X --admin-password Y]  # create schema + S
 python main.py ingest-eml --path ./data/eml_exports          # Mode 2 (priority)
 python main.py ingest-manual [--file msg.eml]                # Mode 3 (stdin if no --file)
 python main.py sync-gmail [--query "newer_than:30d"]         # Mode 1 dev
+python main.py test-imap                                     # diagnose NIC/IMAP connectivity (run first, on VPN)
 python main.py sync-imap [--since 2026-01-01]                # Mode 1 prod (VPN)
 python main.py run-dashboard [--port 8501]                   # Streamlit UI
 python main.py create-user --email X --name N --role R       # roles: admin|manager|senior_viewer|analyst|auditor
@@ -265,6 +266,15 @@ SSL, expected to run **only from inside the UIDAI VPN/intranet**. Assumptions:
   export mailbox folders to `.eml`/`.mbox`/PST from the mail client and ingest
   the folder. (PST needs external conversion: `readpst -e -o out/ file.pst`,
   then `ingest-eml`.)
+
+**Testing against the live mailbox:** this has to happen on a machine that's
+actually on the UIDAI VPN/intranet — an IMAP client connection can't reach
+NIC Mail Cloud from anywhere else, credentials or not. Once `.env` is filled
+in on that machine, run `python main.py test-imap` **first** — it diagnoses
+DNS → TCP → TLS → LOGIN → mailbox SELECT → message count step by step and
+stops at the first failure, without ingesting anything or printing email
+content/credentials. Only once every step passes, run `python main.py
+sync-imap` for a real (idempotent, safe-to-repeat) ingest.
 
 ---
 

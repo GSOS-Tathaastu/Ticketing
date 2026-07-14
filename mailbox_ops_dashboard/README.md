@@ -73,6 +73,7 @@ python main.py ingest-manual [--file msg.eml]                # Mode 3 (stdin if 
 python main.py sync-gmail [--query "newer_than:30d"]         # Mode 1 dev
 python main.py test-imap                                     # diagnose NIC/IMAP connectivity (run first, on VPN)
 python main.py sync-imap [--since 2026-01-01]                # Mode 1 prod (VPN)
+python main.py check-sync-health                             # exit-code health check for cron/monitoring
 python main.py run-dashboard [--port 8501]                   # Streamlit UI
 python main.py create-user --email X --name N --role R       # roles: admin|manager|senior_viewer|analyst|auditor
 python main.py recalculate-tickets                           # rebuild tickets/status/SLA (safe to re-run)
@@ -166,6 +167,12 @@ PostgreSQL. Core tables:
 - **macros** — a named, reusable bundle of field changes for bulk actions
 - `emails` also gains `manual_thread_key` — a manual, permanent override of
   the normal thread-reconstruction, used by ticket merge/split
+- **detection_keywords** — admin-editable escalation/closure/onboarding
+  classifier phrases (see "Additional operational features" below)
+- **ticket_watchers** — a user following a ticket for visibility without
+  owning it
+- `tickets` also gains `locked_by_user_id` / `locked_at` — agent collision
+  detection's advisory marker
 
 Full column lists are in [`db/models.py`](db/models.py). **Note:** the MVP
 uses `create_all` with no Alembic (see `db/migrations_or_init.py`) — an
@@ -267,6 +274,59 @@ what fits a local, no-external-send, audit-logged internal mailbox tool:
   original auto-computed thread, not necessarily the merged destination —
   acceptable for the same reason as the other best-effort detection
   cascades in this project (manual correction is always available).
+
+---
+
+## Additional operational features
+
+Seven more features, scoped to what genuinely fits this project (some
+evaluated alongside Zammad and deliberately deferred/excluded — see
+`ROADMAP.md` "Out of scope"):
+
+- **Full-text search** — Work Queue → "Search subject / requester / email
+  body". Deliberately plain, portable `ILIKE` across `Ticket.subject`,
+  `requester_email`/`requester_name`, and `Email.body_text` — **not** SQLite
+  FTS5, which is a vendor-specific virtual table that would break the
+  one-env-var Postgres migration path. Fine at this project's scale; an
+  index-backed search (Postgres `tsvector`, or FTS5 specifically on SQLite)
+  is a natural follow-up if ticket volume ever makes this slow.
+- **Bulk import of requesting entities (CSV)** — Admin → Entities → "Bulk
+  import entities (CSV)". Matches an existing entity by PAN first, then
+  exact name; only overwrites a field the CSV row actually has a non-blank
+  value for, so a partial re-import never blanks out data.
+- **Admin-editable detection keywords** — Admin → **Detection keywords**:
+  tune the escalation/closure status-inference keywords and the AUA/KUA
+  onboarding classifier without a code change/redeploy. Phrases are always
+  matched as **literal substrings**, never compiled as user-supplied regex
+  (an admin-editable free-text field must not become a regex-injection/ReDoS
+  surface). Takes effect on the next ticket rebuild — same
+  refresh-a-mutable-singleton-once-per-entrypoint pattern as
+  `config/runtime_settings.py`'s admin-editable settings. Signature-pattern
+  and per-onboarding-stage keyword editing are **not** covered (structurally
+  different from a flat phrase list) — noted in `ROADMAP.md` as a follow-up.
+- **Agent collision detection** — advisory only, never blocks anything.
+  Opening a ticket's drill-down "touches" a lock marker; if a *different*
+  user touched it within the last 10 minutes, a warning banner shows who and
+  how long ago, so two analysts don't silently overwrite each other's edit.
+  Single-process Streamlit app, so this is a simple `locked_by`/`locked_at`
+  marker, not true real-time presence.
+- **Ticket watchers / CC subscribers** — 👁 Watch/Unwatch button in the
+  drill-down; a "Watching only" filter on the Work Queue. Self-service,
+  internal-only visibility without owning the ticket or being a detected
+  contributing agent — doesn't touch the no-external-send rule.
+- **Richer attachment metadata** — filename, content-type, and size were
+  already captured by the normalizer; this surfaces them: a 📎 count column
+  on the Work Queue, and per-attachment filename/type/size in the drill-down
+  timeline. Still a metadata pointer, not a document store.
+- **Sync health / heartbeat monitoring** — a health banner on the Data
+  Quality dashboard (only shown in `live_sync` mode — export/manual ingestion
+  never writes a `SyncRun`, so "never synced" there just means how that mode
+  works, not a problem) plus `python main.py check-sync-health`, an
+  exit-code check (`0`=healthy, `1`=stale/failed, `2`=not applicable) for
+  wiring into your own cron/monitoring alerting — this project doesn't send
+  the alert itself, consistent with "no sending from the dashboard".
+  Threshold is `sync_max_age_hours` (default 24), admin-editable under
+  Admin → Settings.
 
 ---
 

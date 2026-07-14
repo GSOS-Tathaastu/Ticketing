@@ -20,6 +20,7 @@ import re
 from sqlalchemy.orm import Session
 
 from db.models import RequestingEntity
+from tickets import detection_config
 
 # Fixed, enforced category taxonomy for entity-linked tickets (DESIGN.md §13.6).
 # The general mailbox's free-text `category` field is untouched — this list is
@@ -34,15 +35,6 @@ _PAN_RE = re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b")
 _TAN_RE = re.compile(r"\b[A-Z]{4}[0-9]{5}[A-Z]\b")
 _GSTIN_RE = re.compile(r"\b[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b")
 _CIN_RE = re.compile(r"\b[LUu][0-9]{5}[A-Za-z]{2}[0-9]{4}[A-Za-z]{3}[0-9]{6}\b")
-
-# Keyword classifier for "this looks like AUA/KUA onboarding correspondence".
-_ONBOARDING_RE = re.compile(
-    r"\b(AUA|KUA|Sub-AUA|Sub-KUA|SubAUA|SubKUA|authentication user agency|"
-    r"kyc user agency|aadhaar authentication agreement|in-principle approval|"
-    r"pre-production|pre production|production go-?live|onboarding|"
-    r"joint undertaking|audit compliance checklist)\b",
-    re.IGNORECASE,
-)
 
 _FREE_EMAIL_DOMAINS = {"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "example.com", "example.org"}
 
@@ -63,7 +55,7 @@ def _guess_entity_name(subject: str | None, from_name: str | None, domain: str) 
 
 def is_onboarding_email(subject: str | None, body: str | None) -> bool:
     text = f"{subject or ''}\n{body or ''}"
-    return bool(_ONBOARDING_RE.search(text))
+    return bool(detection_config.active_patterns["onboarding_classifier"].search(text))
 
 
 def _domain_of(email: str | None) -> str:

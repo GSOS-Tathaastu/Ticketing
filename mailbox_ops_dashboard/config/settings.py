@@ -66,6 +66,9 @@ class Settings:
     # ---- Ingestion ------------------------------------------------------
     ingestion_mode: str = os.getenv("INGESTION_MODE", "export")  # export|live_sync|manual
     eml_export_path: Path = field(default_factory=lambda: Path(os.getenv("EML_EXPORT_PATH", str(DATA_DIR / "eml_exports"))))
+    # How stale the last SUCCESSFUL sync can get before Data Quality / the
+    # `check-sync-health` CLI command flags it. Only meaningful for live_sync.
+    sync_max_age_hours: int = _int("SYNC_MAX_AGE_HOURS", 24)
 
     # ---- IMAP (NIC / production) ----------------------------------------
     imap_host: str = os.getenv("IMAP_HOST", "")

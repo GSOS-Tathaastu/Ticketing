@@ -25,6 +25,7 @@ PERM = {
     "configure_automation",     # create/edit/delete automation rules (triggers)
     "configure_macros",         # create/edit/delete macro presets
     "merge_split_tickets",      # merge two tickets, or split one ticket in two
+    "configure_detection_keywords",  # edit escalation/closure/onboarding keyword lists
 }
 
 ROLES: dict[str, set[str]] = {

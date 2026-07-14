@@ -53,3 +53,36 @@ def test_fallback_message_id_when_missing():
 def test_snippet_truncates():
     assert make_snippet("x" * 500, limit=100).endswith("…")
     assert len(make_snippet("short")) == len("short")
+
+
+ATTACHMENT_RAW = """From: Ramesh Kumar <ramesh.kumar@example.com>
+To: UIDAI Helpdesk <helpdesk@uidai.gov.in>
+Subject: Application form attached
+Date: Mon, 06 Jul 2026 09:15:00 +0530
+Message-ID: <att-0001@example.com>
+Content-Type: multipart/mixed; boundary="BOUND"
+
+--BOUND
+Content-Type: text/plain; charset="utf-8"
+
+Please find the form attached.
+--BOUND
+Content-Type: application/pdf
+Content-Disposition: attachment; filename="application_form.pdf"
+
+%PDF-1.4 fake pdf bytes for the test
+--BOUND--
+"""
+
+
+def test_attachment_metadata_includes_filename_type_and_size():
+    """Richer attachment metadata (Work Queue attachment indicator, drill-down
+    timeline) surfaces filename/content_type/size — all three must already be
+    captured by the normalizer, not just has_attachments."""
+    n = normalize_from_string(ATTACHMENT_RAW, provider="eml_export", ingestion_mode="export")
+    assert n["has_attachments"] is True
+    assert len(n["attachment_metadata"]) == 1
+    att = n["attachment_metadata"][0]
+    assert att["filename"] == "application_form.pdf"
+    assert att["content_type"] == "application/pdf"
+    assert att["size"] > 0

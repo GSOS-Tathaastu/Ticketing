@@ -18,7 +18,7 @@ from auth.users import PermissionError_, authenticate  # noqa: E402
 from config.settings import settings  # noqa: E402
 from db.database import get_session, init_db  # noqa: E402
 from dashboard import service as svc  # noqa: E402
-from tickets import sla_engine, stage_detection_engine, status_engine  # noqa: E402
+from tickets import detection_config, sla_engine, stage_detection_engine, status_engine  # noqa: E402
 from tickets.entity_detection_engine import ENTITY_CATEGORIES  # noqa: E402
 
 st.set_page_config(page_title="Mailbox Operations Dashboard", page_icon="📬", layout="wide")
@@ -139,7 +139,8 @@ def page_executive(s):
 # Dashboard B — Work Queue
 # --------------------------------------------------------------------------- #
 _WQ_FILTER_KEYS = ["owner", "dept", "status", "inferred", "priority", "ageing", "lastfrom",
-                   "category", "tag", "breached", "unassigned", "escalated", "unknown", "multi", "contrib"]
+                   "category", "tag", "breached", "unassigned", "escalated", "unknown", "multi",
+                   "contrib", "watching", "search"]
 
 
 def _wq_clamp(key: str, options: list, default=None):
@@ -167,11 +168,13 @@ def page_work_queue(s):
     omap = svc.owners_map(s)
     u = UserObj(current_user())
 
+    watched_ids = svc.watched_ticket_ids(s, u.id)
     rows = []
     for t in tickets:
         owner = omap.get(t.primary_owner_user_id)
         entity = svc.get_entity(s, t.requesting_entity_id) if t.requesting_entity_id else None
         tags = svc.tags_for(s, t.id)
+        attach_n = svc.attachment_count(s, t.id)
         last_from = "—"
         if t.last_customer_email_at and t.last_agent_email_at:
             last_from = "customer" if svc._aware(t.last_customer_email_at) >= svc._aware(t.last_agent_email_at) else "agent"
@@ -190,12 +193,13 @@ def page_work_queue(s):
             "Ageing (d)": t.ageing_days, "Last email from": last_from,
             "Last email": svc._aware(t.last_email_at).strftime("%Y-%m-%d %H:%M") if t.last_email_at else "—",
             "SLA": t.sla_status or "—", "Tags": ", ".join(tags) or "—",
+            "📎": attach_n or "—", "👁": "✓" if t.id in watched_ids else "",
             "Action needed": _action_needed(t),
             "_owner_id": t.primary_owner_user_id, "_escalated": t.is_escalated,
             "_unassigned": t.primary_owner_user_id is None,
             "_multi": svc.contributor_count(s, t.id) > 1,
             "_unknown_agent": (not t.last_action_by_agent_id and bool(t.last_agent_email_at)),
-            "_last_from": last_from, "_tags": tags,
+            "_last_from": last_from, "_tags": tags, "_watching": t.id in watched_ids,
         })
     df = pd.DataFrame(rows)
 
@@ -226,8 +230,6 @@ def page_work_queue(s):
             dpick = dc[0].selectbox("Delete a view you own", list(dopts), key="wq_delete_view_pick")
             if dc[1].button("Delete"):
                 _mutate(s, lambda ss: svc.delete_saved_view(ss, u, dopts[dpick]))
-                s.commit()
-                st.rerun()
 
     with st.expander("Filters", expanded=True):
         owner_opts = ["(all)", "Unassigned"] + sorted({r["Primary owner"] for r in rows if r["Primary owner"] != "—"})
@@ -257,12 +259,14 @@ def page_work_queue(s):
         c = st.columns(2)
         f_tag = c[0].selectbox("Tag", tag_opts, key="wq_tag")
         f_contrib = c[1].text_input("Contributing agent contains", key="wq_contrib")
-        c = st.columns(5)
+        f_search = st.text_input("Search subject / requester / email body", key="wq_search")
+        c = st.columns(6)
         f_breached = c[0].checkbox("SLA breached", key="wq_breached")
         f_unassigned = c[1].checkbox("Unassigned", key="wq_unassigned")
         f_escalated = c[2].checkbox("Escalated", key="wq_escalated")
         f_unknown = c[3].checkbox("Unknown agent", key="wq_unknown")
         f_multi = c[4].checkbox("Multiple agents", key="wq_multi")
+        f_watching = c[5].checkbox("Watching only", key="wq_watching")
 
     if not df.empty:
         if f_owner == "Unassigned":
@@ -295,6 +299,11 @@ def page_work_queue(s):
             df = df[df["_unknown_agent"]]
         if f_multi:
             df = df[df["_multi"]]
+        if f_watching:
+            df = df[df["_watching"]]
+        if f_search.strip():
+            matching = svc.search_ticket_ids(s, f_search)
+            df = df[df["PK"].isin(matching)]
         if f_contrib.strip():
             needle = f_contrib.strip().lower()
             keep = [tid for tid in df["PK"] if any(
@@ -306,7 +315,7 @@ def page_work_queue(s):
     display_cols = ["Ticket ID", "Subject", "Requester", "Entity", "Primary owner", "Contrib.",
                     "Last action by", "Department", "Category", "Manual status",
                     "Inferred status", "Pending with", "Priority", "Ageing (d)",
-                    "Last email from", "Last email", "SLA", "Tags", "Action needed"]
+                    "Last email from", "Last email", "SLA", "Tags", "📎", "👁", "Action needed"]
     st.dataframe(df[display_cols] if not df.empty else df, use_container_width=True, hide_index=True)
 
     if not df.empty and can("drilldown_tickets"):
@@ -402,6 +411,31 @@ def page_drilldown(s):
     chosen = st.selectbox("Ticket", list(labels), index=list(labels).index(default_label))
     ticket = svc.get_ticket(s, labels[chosen])
     st.session_state["active_ticket"] = ticket.id
+    uo = UserObj(current_user())
+
+    # Agent collision detection (advisory only) — touch the lock marker every
+    # time this page renders for this ticket, and warn if someone else's
+    # touch is still recent. Its own tiny session/commit: not a data
+    # mutation worth _mutate's "Saved." toast or a full-page audit-log entry.
+    lock_ss = get_session()
+    try:
+        collision = svc.touch_ticket_lock(lock_ss, uo, svc.get_ticket(lock_ss, ticket.id))
+        lock_ss.commit()
+    finally:
+        lock_ss.close()
+    if collision:
+        st.warning(f"⚠️ Also opened by **{collision['email']}** {collision['seconds_ago']}s ago — "
+                  "coordinate before saving changes so you don't overwrite each other.")
+
+    # Watchers (Zammad-style CC/subscriber) — self-service toggle.
+    watching = svc.is_watching(s, ticket.id, uo.id)
+    wc = st.columns([1, 5])
+    if wc[0].button("👁 Unwatch" if watching else "👁 Watch"):
+        _mutate(s, lambda ss: (svc.unwatch_ticket if watching else svc.watch_ticket)(
+            ss, uo, svc.get_ticket(ss, ticket.id)))
+    watchers = svc.watchers_for(s, ticket.id)
+    if watchers:
+        wc[1].caption("Watching: " + ", ".join(w.name or w.email for w in watchers))
 
     omap = svc.owners_map(s)
     agents = svc.agents_for(s, ticket.id)
@@ -571,11 +605,14 @@ def _render_event(s, e):
     meta = f"To: {to_list}"
     if cc_list:
         meta += f" · Cc: {cc_list}"
+    st.caption(meta)
     if e.has_attachment:
         atts = svc.load_json(e.attachment_metadata)
-        names = ", ".join(a.get("filename") or a.get("content_type", "?") for a in atts)
-        meta += f" · 📎 {names}"
-    st.caption(meta)
+        for a in atts:
+            name = a.get("filename") or "(unnamed)"
+            ctype = a.get("content_type") or "unknown type"
+            size = a.get("size")
+            st.caption(f"　📎 {name} · {ctype}" + (f" · {_fmt_size(size)}" if size else ""))
     with st.expander("Show / hide body"):
         st.text(e.body_text or e.body_snippet or "(no body)")
     st.divider()
@@ -819,6 +856,19 @@ def page_category(s):
 # --------------------------------------------------------------------------- #
 def page_data_quality(s):
     st.header("G · Mailbox Sync & Data Quality")
+    health = svc.sync_health(s)
+    if health["applicable"]:
+        if health["status"] == svc.SYNC_OK:
+            st.success(f"✓ Sync healthy — last successful sync {health['age_hours']}h ago "
+                      f"(threshold {health['threshold_hours']}h).")
+        elif health["status"] == svc.SYNC_STALE:
+            st.error(f"✗ Sync is STALE — last successful sync {health['age_hours']}h ago, "
+                    f"threshold is {health['threshold_hours']}h. Check the scheduled sync job.")
+        else:
+            st.error("✗ Never synced successfully yet in live_sync mode.")
+        if health["last_attempt_success"] is False:
+            st.warning(f"⚠️ Most recent sync attempt at {_fmt(health['last_attempt_at'])} failed — "
+                      "see the sync run's notes, or re-run `sync-imap`/`sync-gmail` to see the error.")
     m = svc.data_quality_metrics(s)
     c = st.columns(4)
     c[0].metric("Current ingestion mode", settings.ingestion_mode)
@@ -922,7 +972,8 @@ def page_admin(s):
     st.header("Admin")
     from db.models import SlaRule, User
 
-    tabs = st.tabs(["Users", "SLA rules", "Entities", "Settings", "Automation rules", "Macros"])
+    tabs = st.tabs(["Users", "SLA rules", "Entities", "Settings", "Automation rules", "Macros",
+                   "Detection keywords"])
     with tabs[0]:
         st.subheader("Users")
         users = s.query(User).all()
@@ -1006,6 +1057,30 @@ def page_admin(s):
         else:
             st.caption("No entities yet — created automatically from onboarding correspondence, "
                       "or manually below.")
+
+        if can("manage_onboarding"):
+            with st.expander("Bulk import entities (CSV)", expanded=False):
+                st.caption("Matches an existing entity by PAN first, then by exact name; only "
+                          "overwrites a field the CSV row actually has a value for.")
+                st.download_button("⬇️ Download CSV template", data=svc.ENTITY_CSV_TEMPLATE,
+                                   file_name="entities_template.csv", mime="text/csv")
+                up = st.file_uploader("Upload entities CSV", type=["csv"], key="entities_csv_upload")
+                if up is not None and st.button("Import"):
+                    ss = get_session()
+                    try:
+                        result = svc.import_entities_csv(ss, UserObj(current_user()), up.getvalue())
+                        ss.commit()
+                        st.success(f"Created {result['created']}, updated {result['updated']}, "
+                                  f"skipped {result['skipped']}.")
+                        for err in result["errors"]:
+                            st.caption(f"⚠️ {err}")
+                    except Exception as exc:  # noqa: BLE001
+                        ss.rollback()
+                        st.error(str(exc))
+                    finally:
+                        ss.close()
+                    st.rerun()
+
         if can("manage_onboarding"):
             with st.form("new_entity"):
                 st.markdown("**Register an entity**")
@@ -1096,12 +1171,15 @@ def page_admin(s):
             mailboxes2 = c[1].text_area("Common/shared mailboxes (comma-separated)",
                                         ", ".join(cur["common_mailboxes"]), disabled=not can("configure_internal_domains"))
 
-            st.markdown("**Thresholds** _(requires `configure_sla`)_")
+            st.markdown("**Thresholds** _(requires `configure_sla` / `configure_ingestion`)_")
             c = st.columns(4)
             stale2 = c[0].number_input("Stale after (days)", min_value=1, value=cur["stale_days"], disabled=not can("configure_sla"))
             due2 = c[1].number_input("Default SLA due (hrs)", min_value=1, value=cur["default_sla_hours"], disabled=not can("configure_sla"))
             risk2 = c[2].number_input("Default at-risk window (hrs)", min_value=1, value=cur["sla_at_risk_hours"], disabled=not can("configure_sla"))
             timeout2 = c[3].number_input("Session timeout (min)", min_value=1, value=cur["session_timeout_minutes"], disabled=not can("configure_mailbox"))
+            c = st.columns(4)
+            sync_age2 = c[0].number_input("Sync health threshold (hrs)", min_value=1,
+                                          value=cur["sync_max_age_hours"], disabled=not can("configure_ingestion"))
 
             if st.form_submit_button("Save settings", disabled=not editable):
                 fields = {}
@@ -1111,6 +1189,7 @@ def page_admin(s):
                                  session_timeout_minutes=int(timeout2))
                 if can("configure_ingestion"):
                     fields["ingestion_mode"] = mode2
+                    fields["sync_max_age_hours"] = int(sync_age2)
                 if can("configure_internal_domains"):
                     fields["internal_domains"] = [d.strip() for d in domains2.split(",") if d.strip()]
                     fields["common_mailboxes"] = [m.strip() for m in mailboxes2.split(",") if m.strip()]
@@ -1240,6 +1319,41 @@ def page_admin(s):
                 if st.button("Delete macro"):
                     _mutate(s, lambda ss: svc.delete_macro(ss, UserObj(current_user()), mopts[mpick]))
 
+    with tabs[6]:
+        st.subheader("Detection keywords")
+        st.caption("Tune the escalation/closure status-inference keywords and the AUA/KUA onboarding "
+                  "classifier without a redeploy. Takes effect on the next ticket rebuild "
+                  "(recalculate-tickets, or the next email sync). Matched as literal phrases, "
+                  "case-insensitive — not regex.")
+        kws = svc.list_detection_keywords(s)
+        for category, label in detection_config.CATEGORY_LABELS.items():
+            st.markdown(f"**{label}**")
+            cat_kws = [k for k in kws if k.category == category]
+            if cat_kws:
+                st.dataframe(pd.DataFrame([{
+                    "Phrase": k.phrase, "Active": k.is_active,
+                } for k in cat_kws]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("_(using built-in defaults — nothing customized yet)_")
+            if can("configure_detection_keywords"):
+                c = st.columns([3, 1])
+                new_phrase = c[0].text_input(f"Add phrase to {category}", key=f"kw_new_{category}")
+                if c[1].button("Add", key=f"kw_add_{category}") and new_phrase.strip():
+                    _mutate(s, lambda ss, cat=category, ph=new_phrase: svc.add_detection_keyword(
+                        ss, UserObj(current_user()), cat, ph))
+                if cat_kws:
+                    kopts = {k.phrase: k.id for k in cat_kws}
+                    c = st.columns([3, 1, 1])
+                    kpick = c[0].selectbox("Phrase", list(kopts), key=f"kw_pick_{category}")
+                    picked = next(k for k in cat_kws if k.id == kopts[kpick])
+                    if c[1].button("Toggle active", key=f"kw_toggle_{category}"):
+                        _mutate(s, lambda ss, kid=picked.id, active=not picked.is_active:
+                               svc.set_detection_keyword_active(ss, UserObj(current_user()), kid, active))
+                    if c[2].button("Delete", key=f"kw_del_{category}"):
+                        _mutate(s, lambda ss, kid=picked.id: svc.delete_detection_keyword(
+                            ss, UserObj(current_user()), kid))
+            st.divider()
+
 
 # --------------------------------------------------------------------------- #
 # Audit log
@@ -1257,6 +1371,18 @@ def page_audit(s):
 # --------------------------------------------------------------------------- #
 # Formatting helpers
 # --------------------------------------------------------------------------- #
+def _fmt_size(num_bytes) -> str:
+    try:
+        n = float(num_bytes)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
 def _fmt(d) -> str:
     d = svc._aware(d)
     return d.strftime("%Y-%m-%d %H:%M") if d else "—"

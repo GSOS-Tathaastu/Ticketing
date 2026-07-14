@@ -170,6 +170,11 @@ class Ticket(Base):
     manual_override_flag = Column(Boolean, default=False)  # human edited status
     closure_note = Column(Text)
 
+    # Agent collision detection (advisory only — never blocks an edit, just
+    # warns). Touched whenever a user opens the drill-down for this ticket.
+    locked_by_user_id = Column(Integer, ForeignKey("users.id"))
+    locked_at = Column(DateTime)
+
     # --- AUA/KUA onboarding extension (DESIGN.md §13) --------------------
     requesting_entity_id = Column(Integer, ForeignKey("requesting_entities.id"), index=True)
     related_previous_ticket_id = Column(Integer, ForeignKey("tickets.id"))  # prior attempt, if re-applied
@@ -347,6 +352,38 @@ class Macro(Base):
     action_add_note = Column(Text)
 
     created_by_user_id = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=_utcnow)
+
+
+# --------------------------------------------------------------------------- #
+# Admin-editable detection keyword lists (status escalation/closure, AUA/KUA
+# onboarding classifier). See tickets/detection_config.py — phrases are
+# always matched as literal substrings (never compiled as user-supplied
+# regex), refreshed once per ticket rebuild.
+# --------------------------------------------------------------------------- #
+class DetectionKeyword(Base):
+    __tablename__ = "detection_keywords"
+    __table_args__ = (UniqueConstraint("category", "phrase", name="uq_detection_keyword"),)
+
+    id = Column(Integer, primary_key=True)
+    category = Column(String(32), index=True)  # escalation|closure|onboarding_classifier
+    phrase = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime, default=_utcnow)
+
+
+# --------------------------------------------------------------------------- #
+# Ticket watchers — internal visibility for a ticket without owning or being
+# a detected contributing agent on it (Zammad-style CC/subscriber list).
+# --------------------------------------------------------------------------- #
+class TicketWatcher(Base):
+    __tablename__ = "ticket_watchers"
+    __table_args__ = (UniqueConstraint("ticket_id", "user_id", name="uq_ticket_watcher"),)
+
+    id = Column(Integer, primary_key=True)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     created_at = Column(DateTime, default=_utcnow)
 
 

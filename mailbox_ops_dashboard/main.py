@@ -7,6 +7,7 @@ Commands:
   python main.py sync-gmail [--query "newer_than:30d"]
   python main.py test-imap                    # diagnose NIC/IMAP connectivity, run first
   python main.py sync-imap [--since 2024-01-01]
+  python main.py check-sync-health            # exit-code health check for cron/monitoring
   python main.py run-dashboard [--port 8501]
   python main.py create-user --email X --name N --role R [--password P]
   python main.py recalculate-tickets
@@ -110,6 +111,30 @@ def cmd_test_imap(args) -> None:
         print("\nAll checks passed. Safe to run: python main.py sync-imap")
     else:
         print("\nStopped at the first failing step above — fix that before proceeding.")
+
+
+def cmd_check_sync_health(args) -> None:
+    """For a cron/monitoring wrapper: exit 0 if healthy, 1 if stale/never
+    synced (live_sync mode only) or the last attempt failed, 2 if not
+    applicable (export/manual mode). Prints nothing but a status line —
+    wire your own alerting (email/Slack/etc.) around the exit code."""
+    from dashboard.service import sync_health
+
+    with session_scope() as s:
+        h = sync_health(s)
+    if not h["applicable"]:
+        print(f"n/a — ingestion mode is '{settings.ingestion_mode}', not live_sync")
+        sys.exit(2)
+    if h["status"] == "never_synced":
+        print("✗ never synced")
+        sys.exit(1)
+    mark = "✓" if h["status"] == "ok" else "✗"
+    print(f"{mark} last successful sync {h['age_hours']}h ago "
+          f"(threshold {h['threshold_hours']}h) — {h['status']}")
+    if h["last_attempt_success"] is False:
+        print(f"✗ most recent sync attempt at {h['last_attempt_at']} FAILED")
+        sys.exit(1)
+    sys.exit(0 if h["status"] == "ok" else 1)
 
 
 def cmd_run_dashboard(args) -> None:
@@ -237,6 +262,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     q = sub.add_parser("test-imap", help="Diagnose NIC/IMAP connectivity step by step (run before sync-imap)")
     q.set_defaults(func=cmd_test_imap)
+
+    q = sub.add_parser("check-sync-health", help="Exit-code health check for cron/monitoring wrappers")
+    q.set_defaults(func=cmd_check_sync_health)
 
     q = sub.add_parser("run-dashboard", help="Launch the Streamlit dashboard")
     q.add_argument("--port", type=int, default=8501)

@@ -12,12 +12,16 @@ import zipfile
 
 from sqlalchemy.orm import Session
 
+from sqlalchemy import or_
+
 from auth.users import PermissionError_, require, write_audit
 from config.runtime_settings import NEVER_OVERRIDABLE, OVERRIDABLE, apply_db_overrides, effective_settings_dict
+from config.settings import settings
 from db.models import (
     AppSetting,
     AuditLog,
     AutomationRule,
+    DetectionKeyword,
     Email,
     InternalNote,
     Macro,
@@ -29,9 +33,10 @@ from db.models import (
     TicketAgent,
     TicketEvent,
     TicketTag,
+    TicketWatcher,
     User,
 )
-from tickets import sla_engine, stage_detection_engine, status_engine
+from tickets import detection_config, sla_engine, stage_detection_engine, status_engine
 from tickets.agent_detection_engine import UNKNOWN_AGENT_LABEL
 from tickets.entity_detection_engine import ONBOARDING_CATEGORY
 from tickets.ticket_builder import rebuild_tickets
@@ -80,6 +85,10 @@ def ticket_events(session: Session, ticket_id: int) -> list[TicketEvent]:
         TicketEvent.sent_at.asc().nullslast(), TicketEvent.created_at.asc()).all()
 
 
+def attachment_count(session: Session, ticket_id: int) -> int:
+    return session.query(Email).filter_by(ticket_id=ticket_id, has_attachments=True).count()
+
+
 def ticket_notes(session: Session, ticket_id: int) -> list[InternalNote]:
     return session.query(InternalNote).filter_by(ticket_id=ticket_id).order_by(
         InternalNote.created_at.asc()).all()
@@ -87,6 +96,28 @@ def ticket_notes(session: Session, ticket_id: int) -> list[InternalNote]:
 
 def internal_users(session: Session) -> list[User]:
     return session.query(User).filter(User.internal.is_(True)).order_by(User.name).all()
+
+
+# --------------------------------------------------------------------------- #
+# Full-text search — deliberately plain ILIKE across subject/requester/body,
+# NOT SQLite FTS5 (a vendor-specific virtual table), so the one-env-var
+# Postgres migration path (README) stays true. Fine at this project's scale;
+# an index-backed search (Postgres tsvector, or FTS5 on SQLite specifically)
+# is a documented follow-up if ticket volume ever makes this slow.
+# --------------------------------------------------------------------------- #
+def search_ticket_ids(session: Session, query: str) -> set[int]:
+    query = (query or "").strip()
+    if not query:
+        return set()
+    needle = f"%{query}%"
+    subj_req = session.query(Ticket.id).filter(
+        or_(Ticket.subject.ilike(needle), Ticket.requester_email.ilike(needle),
+            Ticket.requester_name.ilike(needle))
+    ).all()
+    body = session.query(Email.ticket_id).filter(
+        Email.body_text.ilike(needle), Email.ticket_id.isnot(None)
+    ).all()
+    return {r[0] for r in subj_req} | {r[0] for r in body}
 
 
 # --------------------------------------------------------------------------- #
@@ -120,6 +151,62 @@ def untag_ticket(session: Session, user: User, ticket: Ticket, tag: str) -> None
         session.delete(row)
         write_audit(session, user=user, action_type="untag_ticket", entity_type="ticket",
                     entity_id=ticket.ticket_id, old_value=tag)
+
+
+# --------------------------------------------------------------------------- #
+# Ticket watchers / CC subscribers — internal-only visibility without owning
+# the ticket or being a detected contributing agent. Self-service: anyone who
+# can view tickets can watch/unwatch their own subscription.
+# --------------------------------------------------------------------------- #
+def is_watching(session: Session, ticket_id: int, user_id: int) -> bool:
+    return session.query(TicketWatcher).filter_by(ticket_id=ticket_id, user_id=user_id).first() is not None
+
+
+def watchers_for(session: Session, ticket_id: int) -> list[User]:
+    ids = [r.user_id for r in session.query(TicketWatcher).filter_by(ticket_id=ticket_id).all()]
+    return session.query(User).filter(User.id.in_(ids)).order_by(User.name).all() if ids else []
+
+
+def watched_ticket_ids(session: Session, user_id: int) -> set[int]:
+    return {r.ticket_id for r in session.query(TicketWatcher).filter_by(user_id=user_id).all()}
+
+
+def watch_ticket(session: Session, user: User, ticket: Ticket) -> None:
+    require(user, "view_tickets")
+    if not is_watching(session, ticket.id, user.id):
+        session.add(TicketWatcher(ticket_id=ticket.id, user_id=user.id))
+        write_audit(session, user=user, action_type="watch_ticket", entity_type="ticket",
+                    entity_id=ticket.ticket_id)
+
+
+def unwatch_ticket(session: Session, user: User, ticket: Ticket) -> None:
+    require(user, "view_tickets")
+    row = session.query(TicketWatcher).filter_by(ticket_id=ticket.id, user_id=user.id).first()
+    if row:
+        session.delete(row)
+        write_audit(session, user=user, action_type="unwatch_ticket", entity_type="ticket",
+                    entity_id=ticket.ticket_id)
+
+
+# --------------------------------------------------------------------------- #
+# Agent collision detection — advisory only, never blocks an edit. Touched
+# whenever the drill-down opens a ticket; the UI shows a warning banner if a
+# DIFFERENT user's touch is recent. No audit log entry — this is incidental
+# bookkeeping from a view action, not a user-initiated data mutation.
+# --------------------------------------------------------------------------- #
+COLLISION_WINDOW = dt.timedelta(minutes=10)
+
+
+def touch_ticket_lock(session: Session, user: User, ticket: Ticket) -> dict | None:
+    other = None
+    if ticket.locked_by_user_id and ticket.locked_by_user_id != user.id and ticket.locked_at:
+        age = _now() - _aware(ticket.locked_at)
+        if age < COLLISION_WINDOW:
+            locker = session.get(User, ticket.locked_by_user_id)
+            other = {"email": locker.email if locker else "unknown", "seconds_ago": int(age.total_seconds())}
+    ticket.locked_by_user_id = user.id
+    ticket.locked_at = _now()
+    return other
 
 
 # --------------------------------------------------------------------------- #
@@ -168,6 +255,60 @@ def get_entity(session: Session, entity_id: int) -> RequestingEntity | None:
 def entity_tickets(session: Session, entity_id: int) -> list[Ticket]:
     return session.query(Ticket).filter_by(requesting_entity_id=entity_id).order_by(
         Ticket.created_at.desc()).all()
+
+
+ENTITY_CSV_COLUMNS = ["name", "entity_type", "cin", "pan", "tan", "gstin",
+                      "registration_number", "known_domains", "primary_contact_email"]
+ENTITY_CSV_TEMPLATE = ",".join(ENTITY_CSV_COLUMNS) + "\n"
+
+
+def import_entities_csv(session: Session, user: User, csv_bytes: bytes) -> dict:
+    """Bulk-register entities from a CSV (ENTITY_CSV_COLUMNS header). Matches
+    an existing entity by PAN first (a stable government ID), falling back to
+    an exact name match, and updates only the columns the CSV actually
+    provided a non-blank value for — never blanks out a field just because a
+    later import's row omitted it."""
+    require(user, "manage_onboarding")
+    import csv as csv_module
+    import io as io_module
+
+    text = csv_bytes.decode("utf-8-sig")
+    reader = csv_module.DictReader(io_module.StringIO(text))
+    created = updated = skipped = 0
+    errors: list[str] = []
+    for i, row in enumerate(reader, start=2):  # header is row 1
+        name = (row.get("name") or "").strip()
+        if not name:
+            skipped += 1
+            errors.append(f"row {i}: missing required 'name'")
+            continue
+        pan = (row.get("pan") or "").strip().upper() or None
+        existing = session.query(RequestingEntity).filter_by(pan=pan).first() if pan else None
+        existing = existing or session.query(RequestingEntity).filter_by(name=name).first()
+        fields = {
+            "name": name,
+            "entity_type": (row.get("entity_type") or "").strip().lower() or None,
+            "cin": (row.get("cin") or "").strip().upper() or None,
+            "pan": pan,
+            "tan": (row.get("tan") or "").strip().upper() or None,
+            "gstin": (row.get("gstin") or "").strip().upper() or None,
+            "registration_number": (row.get("registration_number") or "").strip() or None,
+            "known_domains": (row.get("known_domains") or "").strip() or None,
+            "primary_contact_email": (row.get("primary_contact_email") or "").strip().lower() or None,
+        }
+        if existing:
+            for k, v in fields.items():
+                if v:
+                    setattr(existing, k, v)
+            updated += 1
+        else:
+            fields["entity_type"] = fields["entity_type"] or "other"
+            session.add(RequestingEntity(**fields, auto_created=False))
+            created += 1
+    session.flush()
+    write_audit(session, user=user, action_type="import_entities_csv", entity_type="requesting_entity",
+                entity_id="bulk", new_value={"created": created, "updated": updated, "skipped": skipped})
+    return {"created": created, "updated": updated, "skipped": skipped, "errors": errors[:20]}
 
 
 def onboarding_overview(session: Session) -> list[dict]:
@@ -345,6 +486,28 @@ def category_metrics(session: Session) -> dict:
         c["avg_ageing"] = round(c["ageing_sum"] / c["count"], 1) if c["count"] else 0
     top_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)[:10]
     return {"by_category": list(by_cat.values()), "top_domains": top_domains}
+
+
+SYNC_OK, SYNC_STALE, SYNC_NEVER = "ok", "stale", "never_synced"
+
+
+def sync_health(session: Session) -> dict:
+    """Used by the Data Quality dashboard's health banner and the
+    `check-sync-health` CLI command (roadmap: "alert if a scheduled sync
+    starts silently failing"). Only meaningful in live_sync mode — export/
+    manual ingestion never writes a SyncRun, so "never synced" there isn't a
+    problem, just how those modes work (`applicable=False`)."""
+    applicable = settings.ingestion_mode == "live_sync"
+    last_success = session.query(SyncRun).filter_by(success=True).order_by(SyncRun.finished_at.desc()).first()
+    last_attempt = session.query(SyncRun).order_by(SyncRun.started_at.desc()).first()
+    base = {"applicable": applicable, "threshold_hours": settings.sync_max_age_hours,
+           "last_attempt_success": last_attempt.success if last_attempt else None,
+           "last_attempt_at": last_attempt.started_at if last_attempt else None}
+    if last_success is None or last_success.finished_at is None:
+        return {**base, "status": SYNC_NEVER, "age_hours": None, "last_success_at": None}
+    age_hours = (_now() - _aware(last_success.finished_at)).total_seconds() / 3600
+    status = SYNC_STALE if age_hours > settings.sync_max_age_hours else SYNC_OK
+    return {**base, "status": status, "age_hours": round(age_hours, 1), "last_success_at": last_success.finished_at}
 
 
 def data_quality_metrics(session: Session) -> dict:
@@ -662,6 +825,56 @@ def delete_macro(session: Session, user: User, macro_id: int) -> None:
         return
     session.delete(macro)
     write_audit(session, user=user, action_type="delete_macro", entity_type="macro", entity_id=macro_id)
+
+
+# --------------------------------------------------------------------------- #
+# Detection keywords (Admin -> Detection keywords). Evaluation reads a
+# refreshed-once-per-rebuild singleton in tickets/detection_config.py — this
+# section is CRUD only, same split as automation rules above.
+# --------------------------------------------------------------------------- #
+def list_detection_keywords(session: Session) -> list[DetectionKeyword]:
+    return session.query(DetectionKeyword).order_by(
+        DetectionKeyword.category, DetectionKeyword.phrase).all()
+
+
+def add_detection_keyword(session: Session, user: User, category: str, phrase: str) -> DetectionKeyword:
+    require(user, "configure_detection_keywords")
+    if category not in detection_config.DEFAULT_KEYWORDS:
+        raise ValueError(f"Unknown category '{category}'")
+    phrase = phrase.strip()
+    existing = session.query(DetectionKeyword).filter_by(category=category, phrase=phrase).first()
+    if existing:
+        existing.is_active = True
+        write_audit(session, user=user, action_type="reactivate_detection_keyword",
+                    entity_type="detection_keyword", entity_id=existing.id)
+        return existing
+    kw = DetectionKeyword(category=category, phrase=phrase, is_active=True, created_by_user_id=user.id)
+    session.add(kw)
+    session.flush()
+    write_audit(session, user=user, action_type="add_detection_keyword", entity_type="detection_keyword",
+                entity_id=kw.id, new_value={"category": category, "phrase": phrase})
+    return kw
+
+
+def set_detection_keyword_active(session: Session, user: User, keyword_id: int, is_active: bool) -> None:
+    require(user, "configure_detection_keywords")
+    kw = session.get(DetectionKeyword, keyword_id)
+    if kw is None:
+        return
+    old = kw.is_active
+    kw.is_active = is_active
+    write_audit(session, user=user, action_type="set_detection_keyword_active",
+                entity_type="detection_keyword", entity_id=keyword_id, old_value=old, new_value=is_active)
+
+
+def delete_detection_keyword(session: Session, user: User, keyword_id: int) -> None:
+    require(user, "configure_detection_keywords")
+    kw = session.get(DetectionKeyword, keyword_id)
+    if kw is None:
+        return
+    session.delete(kw)
+    write_audit(session, user=user, action_type="delete_detection_keyword",
+                entity_type="detection_keyword", entity_id=keyword_id)
 
 
 # --------------------------------------------------------------------------- #

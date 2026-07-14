@@ -35,6 +35,7 @@ OVERRIDABLE: dict[str, tuple[str, callable, str]] = {
     "imap_mailbox": ("imap_mailbox", _STR, "configure_mailbox"),
     "imap_use_ssl": ("imap_use_ssl", _BOOL, "configure_mailbox"),
     "ingestion_mode": ("ingestion_mode", _STR, "configure_ingestion"),
+    "sync_max_age_hours": ("sync_max_age_hours", _INT, "configure_ingestion"),
     "internal_domains": ("internal_domains", _CSV, "configure_internal_domains"),
     "common_mailboxes": ("common_mailboxes", _CSV, "configure_internal_domains"),
     "stale_days": ("stale_days", _INT, "configure_sla"),

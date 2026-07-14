@@ -7,6 +7,7 @@ import datetime as dt
 import re
 
 from config.settings import settings
+from tickets import detection_config
 
 # Inferred status values
 PENDING_INTERNAL = "Pending with Internal Team"
@@ -21,12 +22,6 @@ PW_INTERNAL = "internal_team"
 PW_REQUESTER = "requester"
 PW_NONE = "none"
 
-_ESCALATION_RE = re.compile(r"\b(urgent|asap|escalat\w*|immediately|follow[\s-]?up|reminder|" \
-                            r"very important|top priority|priority)\b", re.IGNORECASE)
-_CLOSURE_RE = re.compile(r"\b(resolved|closed|completed|done|fixed|issue resolved|"
-                         r"has been resolved|closing this|marking as closed)\b", re.IGNORECASE)
-
-
 def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -39,11 +34,11 @@ def _aware(d: dt.datetime | None) -> dt.datetime | None:
 
 
 def detect_escalation(text: str | None) -> bool:
-    return bool(text and _ESCALATION_RE.search(text))
+    return bool(text and detection_config.active_patterns["escalation"].search(text))
 
 
 def detect_closure(text: str | None) -> bool:
-    return bool(text and _CLOSURE_RE.search(text))
+    return bool(text and detection_config.active_patterns["closure"].search(text))
 
 
 def infer_status(*, has_owner: bool, last_direction: str | None,

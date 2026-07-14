@@ -30,6 +30,9 @@ def bootstrap(admin_email: str | None = None, admin_password: str | None = None)
     settings.ensure_dirs()
     with session_scope() as s:
         seed_sla(s)
+        from tickets.detection_config import seed_defaults as seed_detection_keywords
+
+        seed_detection_keywords(s)
         if admin_email and admin_password and not s.query(User).filter_by(email=admin_email.lower()).first():
             # imported here to avoid a circular import at module load
             from auth.users import create_user

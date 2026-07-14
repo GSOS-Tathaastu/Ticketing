@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from config.settings import settings
 from db.models import Email, InternalNote, Ticket, TicketAgent, TicketEvent, TicketTag, User
-from tickets import automation_engine, sla_engine, status_engine, stage_detection_engine
+from tickets import automation_engine, detection_config, sla_engine, status_engine, stage_detection_engine
 from tickets.agent_detection_engine import (
     UNKNOWN_AGENT_LABEL,
     detect_agent,
@@ -38,6 +38,11 @@ def _detected_action_type(direction: str, body: str | None) -> str:
 
 def rebuild_tickets(session: Session) -> dict:
     """Full idempotent rebuild. Returns summary stats."""
+    # Admin-edited escalation/closure/onboarding keyword lists (Admin ->
+    # Detection keywords) take effect from here on for this rebuild — cheap
+    # (one query), same "refresh a mutable singleton once per entrypoint"
+    # pattern as config/runtime_settings.py's apply_db_overrides.
+    detection_config.refresh_from_db(session)
     recompute_thread_keys(session)
     known = _load_known_users(session)
 
